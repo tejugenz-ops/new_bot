@@ -22,7 +22,7 @@ import (
 
 // ──────────────────────── config ────────────────────────────────────
 
-const botToken = "8732914063:AAHKSC1R2OuwB_HwzaeM-DRiHWMYpyNomKE"
+const botToken = "8958665612:AAHmuyPJ8ls_TKA0V-eDnPtVFTFfignvqhk"
 const usersFile = "users.json"
 const configFile = "botconfig.json"
 const sitesFile = "customsites.json"

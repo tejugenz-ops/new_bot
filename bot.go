@@ -695,18 +695,17 @@ func formatChargedMsg(card string, bin *BINInfo, r *CheckResult, username, proxy
 	if chResp == "" {
 		chResp = "ORDER_PLACED"
 	}
-	return "<b><i>Charged</i></b>\n" +
+	return "Charged\n" +
 		"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
-		"<b>Card</b>\n" +
-		"└ <code>" + card + "</code>\n" +
-		"<b>Gateway</b> => <b>" + chGw + "</b>\n" +
-		"<b>Response</b> => <b>" + chResp + "</b>\n" +
-		"<b>Price</b> => <b>" + r.Amount + "</b>\n\n" +
-		"<b>Brand</b> => <b>" + bin.Brand + "</b>\n" +
-		"<b>Bank</b> => <b>" + bin.Bank + "</b>\n" +
-		"<b>Country</b> => <b>" + bin.Country + "</b>\n\n" +
-		"<b>User</b> => <b>@" + username + "</b>\n" +
-		"<b>Proxy</b> => " + px
+		"Card: " + card + "\n" +
+		"Gateway: " + chGw + "\n" +
+		"Response: " + chResp + "\n" +
+		"Price: " + r.Amount + "\n\n" +
+		"Brand: " + bin.Brand + "\n" +
+		"Bank: " + bin.Bank + "\n" +
+		"Country: " + bin.Country + "\n\n" +
+		"User: @" + username + "\n" +
+		"Proxy: " + px
 }
 
 func formatApprovedMsg(card string, bin *BINInfo, r *CheckResult, username, proxyURL string) string {

@@ -695,18 +695,18 @@ func formatChargedMsg(card string, bin *BINInfo, r *CheckResult, username, proxy
 	if chResp == "" {
 		chResp = "ORDER_PLACED"
 	}
-	return "<b><i>Charged</i></b> " + em(emojiCharged, "🔥") + "\n" +
+	return "<b><i>Charged</i></b> 🔥\n" +
 		"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
-		em(emojiCard, "💳") + " <b>Card</b>\n" +
+		"💳 <b>Card</b>\n" +
 		"└ <code>" + card + "</code>\n" +
-		em(emojiGateway, "🔗") + " <b>Gateway</b> ⇒ <b>" + chGw + "</b>\n" +
-		em(emojiDoc, "📋") + " <b>Response</b> ⇒ <b>" + chResp + "</b>\n" +
-		em(emojiPrice, "💲") + " <b>Price</b> ⇒ <b>" + r.Amount + "</b> " + em(emojiPrice, "💲") + "\n\n" +
-		em(emojiBrand, "🔰") + " <b>Brand</b> ⇒ <b>" + bin.Brand + "</b>\n" +
-		em(emojiBank, "🏦") + " <b>Bank</b> ⇒ <b>" + bin.Bank + "</b>\n" +
-		em(emojiGlobe, "🌍") + " <b>Country</b> ⇒ <b>" + bin.Country + "</b> " + bin.CountryFlag + "\n\n" +
-		em(emojiUser, "👤") + " <b>User</b> ⇒ <b>@" + username + "</b>\n" +
-		em(emojiLightning, "⚡") + " <b>Owner</b> ⇒ @aldorsi / " + em(emojiGlobe, "🌐") + " <b>Px</b> ⇒ " + px
+		"🔗 <b>Gateway</b> ⇒ <b>" + chGw + "</b>\n" +
+		"📋 <b>Response</b> ⇒ <b>" + chResp + "</b>\n" +
+		"💲 <b>Price</b> ⇒ <b>" + r.Amount + "</b>\n\n" +
+		"🔰 <b>Brand</b> ⇒ <b>" + bin.Brand + "</b>\n" +
+		"🏦 <b>Bank</b> ⇒ <b>" + bin.Bank + "</b>\n" +
+		"🌍 <b>Country</b> ⇒ <b>" + bin.Country + "</b> " + bin.CountryFlag + "\n\n" +
+		"👤 <b>User</b> ⇒ <b>@" + username + "</b>\n" +
+		"⚡ <b>Owner</b> ⇒ @aldorsi / 🌐 <b>Px</b> ⇒ " + px
 }
 
 func formatApprovedMsg(card string, bin *BINInfo, r *CheckResult, username, proxyURL string) string {

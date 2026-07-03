@@ -13,6 +13,7 @@ import (
 	"net/textproto"
 	"net/url"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -24,12 +25,33 @@ import (
 )
 
 
-const botToken = "8903697089:AAEvpTKHTkZcLOkAMKDqZBLRr7flZzoEP-A"
+const botToken = "8788514474:AAFzfOSLLxnhL064Da8aAcJwrmggIa3q0Ak"
 const logsGroupID = -1004545134344
-const usersFile = "users.json"
-const configFile = "botconfig.json"
-const sitesFile = "customsites.json"
-const keysFile = "customkeys.json"
+var usersFile = "users.json"
+var configFile = "botconfig.json"
+var sitesFile = "customsites.json"
+var keysFile = "customkeys.json"
+
+func resolveDataDir() string {
+	candidates := []string{"/data", "./data"}
+	for _, c := range candidates {
+		if fi, err := os.Stat(c); err == nil && fi.IsDir() {
+			return c
+		}
+	}
+	return "."
+}
+
+func init() {
+	dataDir := resolveDataDir()
+	if dataDir != "." {
+		usersFile = filepath.Join(dataDir, "users.json")
+		configFile = filepath.Join(dataDir, "botconfig.json")
+		sitesFile = filepath.Join(dataDir, "customsites.json")
+		keysFile = filepath.Join(dataDir, "customkeys.json")
+		fmt.Printf("[DATA] using data directory: %s\n", dataDir)
+	}
+}
 
 var adminIDs = map[int64]bool{
 	5733576801: true,
@@ -623,18 +645,21 @@ func (k *KeyManager) Generate(keyType string, credits int64, duration string) (*
 
 func (k *KeyManager) Redeem(code string, uid int64) (*Key, error) {
 	k.mu.Lock()
-	defer k.mu.Unlock()
 	key, ok := k.keys[code]
 	if !ok {
+		k.mu.Unlock()
 		return nil, fmt.Errorf("invalid key")
 	}
 	if !key.Active {
+		k.mu.Unlock()
 		return nil, fmt.Errorf("key is deactivated")
 	}
 	if key.ActivatedAt > 0 && key.Type == "credits" {
+		k.mu.Unlock()
 		return nil, fmt.Errorf("key already redeemed")
 	}
 	if key.Type == "unlimited" && key.ActivatedAt > 0 && key.ExpiresAt > time.Now().Unix() {
+		k.mu.Unlock()
 		return nil, fmt.Errorf("key already active")
 	}
 	now := time.Now()
@@ -645,6 +670,7 @@ func (k *KeyManager) Redeem(code string, uid int64) (*Key, error) {
 	} else if key.Duration == "permanent" {
 		key.ExpiresAt = 0
 	}
+	k.mu.Unlock()
 	k.Save()
 	return key, nil
 }
@@ -906,7 +932,11 @@ func getSitePool() []string {
 }
 
 
-func formatWelcomeCard(uid int64, username string, proxyCount int, credits float64) string {
+func formatWelcomeCard(uid int64, username string, proxyCount int, credits float64, hasUnlimited bool) string {
+	creditsStr := strconvFloat(credits)
+	if hasUnlimited {
+		creditsStr = "Unlimited"
+	}
 	return "====================\n" +
 		"STATUS -> " + em(emojiCheck, "\xe2\x9c\x85") + " <b>Active</b> " + em(emojiCheck, "\xe2\x9c\x85") + "\n" +
 		"====================\n" +
@@ -914,7 +944,7 @@ func formatWelcomeCard(uid int64, username string, proxyCount int, credits float
 		em(emojiUser, "\xf0\x9f\x91\xa4") + " <b>User</b> -> @" + html.EscapeString(username) + "\n" +
 		em(emojiStar, "\xe2\xad\x90") + " <b>Bot</b> -> CC Checker\n" +
 		em(emojiCalendar, "\xf0\x9f\x93\x85") + " <b>Proxies</b> -> " + strconv.Itoa(proxyCount) + " loaded\n" +
-		em(emojiPrice, "\xf0\x9f\x92\xb0") + " <b>Credits</b> -> " + strconvFloat(credits) + "\n" +
+		em(emojiPrice, "\xf0\x9f\x92\xb0") + " <b>Credits</b> -> " + creditsStr + "\n" +
 		em(emojiLightning, "\xe2\x9a\xa1") + " <b>Owner</b> -> @SORRY_00001\n" +
 		"===================="
 }
@@ -1851,7 +1881,7 @@ isPrivate := c.Chat().Type == tele.ChatPrivate
 		username := c.Sender().Username
 		um.SetUsername(uid, username)
 		ud := um.Get(uid)
-		return c.Send(formatWelcomeCard(uid, username, len(ud.Proxies), ud.Credits), startMenu, tele.ModeHTML)
+		return c.Send(formatWelcomeCard(uid, username, len(ud.Proxies), ud.Credits, um.HasUnlimited(uid)), startMenu, tele.ModeHTML)
 	})
 
 	bot.Handle(&btnGates, func(c tele.Context) error {
@@ -2748,7 +2778,8 @@ bot.Handle("/admin", func(c tele.Context) error {
 				"-> " + em("5039614900280754969", "\xe2\x9c\x85") + " /delallkeys  - Delete all keys\n" +
 				"-> " + em("5409048419211682843", "\xe2\x9c\x85") + " /editfreelimit &lt;amount&gt;  - Change daily limit\n" +
 				"-> " + em("5999317873623831250", "\xe2\x9c\x85") + " /addcredit &lt;@u|id&gt; &lt;amt&gt;  - Add credits\n" +
-				"-> " + em("5039891861246838069", "\xe2\x9c\x85") + " /removecredit &lt;@u|id&gt; &lt;amt&gt;  - Remove credits\n\n" +
+				"-> " + em("5039891861246838069", "\xe2\x9c\x85") + " /removecredit &lt;@u|id&gt; &lt;amt&gt;  - Remove credits\n" +
+				"-> " + em("5039891861246838069", "\xe2\x9c\x85") + " /checkcredit &lt;@u|id&gt;  - View user balance\n\n" +
 				em("5039614900280754969", "\xe2\x9c\x85") + " <b>Site Management</b>\n" +
 				"-> " + em("5352585602317426381", "\xe2\x9c\x85") + " /addsite &lt;url&gt;  - Add site\n" +
 				"-> " + em("5039649904264217620", "\xe2\x9c\x85") + " /rmsite &lt;url&gt;   - Remove site\n" +
@@ -3171,17 +3202,106 @@ bot.Handle("/admin", func(c tele.Context) error {
 		return c.Send(" Removed " + amountStr + " credits from user " + strconv.FormatInt(targetUID, 10) + ". New balance: " + strconvFloat(newBalance) + "", tele.ModeHTML)
 	})
 
+	bot.Handle("/checkcredit", func(c tele.Context) error {
+		if !isAdmin(c.Sender().ID) {
+			return c.Send(" Admin only.")
+		}
+		parts := strings.Fields(c.Message().Payload)
+		if len(parts) < 1 {
+			return c.Send("Usage: /checkcredit &lt;@username|user_id&gt;")
+		}
+		target := parts[0]
+		var targetUID int64
+		if strings.HasPrefix(target, "@") {
+			uid, found := um.FindByUsername(target)
+			if !found {
+				return c.Send(fmt.Sprintf(" No known user with username %s.", target))
+			}
+			targetUID = uid
+		} else {
+			uid, err := strconv.ParseInt(target, 10, 64)
+			if err != nil {
+				return c.Send(" Invalid user ID or username.")
+			}
+			targetUID = uid
+		}
+		ud := um.Get(targetUID)
+		um.mu.RLock()
+		credits := ud.Credits
+		username := ud.Username
+		dailyCount := ud.DailyCount
+		stats := ud.Stats
+		um.mu.RUnlock()
+		hasUnlimited := um.HasUnlimited(targetUID)
+		limit := currentDailyLimit()
+
+		creditsStr := strconvFloat(credits)
+		if hasUnlimited {
+			creditsStr = "Unlimited"
+		}
+		unlimitedStr := "No"
+		if hasUnlimited {
+			unlimitedStr = "Yes"
+		}
+		approvedRate, chargedRate := 0.0, 0.0
+		if stats.TotalChecked > 0 {
+			approvedRate = float64(stats.TotalApproved) * 100.0 / float64(stats.TotalChecked)
+			chargedRate = float64(stats.TotalCharged) * 100.0 / float64(stats.TotalChecked)
+		}
+		return c.Send(fmt.Sprintf(
+			"==============================\n"+
+				"    "+em(emojiUser, "\xf0\x9f\x91\xa4")+" <b>User Credit Profile</b> "+em(emojiUser, "\xf0\x9f\x91\xa4")+"\n"+
+				"==============================\n\n"+
+				em(emojiBlue, "\xf0\x9f\x94\xb5")+" <b>User ID</b> -> <code>%d</code>\n"+
+				em(emojiUser, "\xf0\x9f\x91\xa4")+" <b>Username</b> -> @%s\n"+
+				em(emojiPrice, "\xf0\x9f\x92\xb0")+" <b>Credits</b> -> %s\n"+
+				em(emojiStar, "\xe2\xad\x90")+" <b>Unlimited</b> -> %s\n"+
+				em(emojiCalendar, "\xf0\x9f\x93\x85")+" <b>Daily</b> -> %d / %d\n\n"+
+				"------------------------------\n"+
+				em(emojiRowCheck, "\xe2\x9c\x85")+" <b>Total Checked</b>  :  %d\n"+
+				em(emojiRowAppr, "\xe2\x9c\x85")+" <b>Approved</b>       :  %d\n"+
+				em(emojiRowDecl, "\xe2\x9d\x8c")+" <b>Declined</b>       :  %d\n"+
+				em(emojiRowCard, "\xf0\x9f\x92\xb3")+" <b>Charged</b>        :  %d\n"+
+				em(emojiMoney, "\xf0\x9f\x92\xb0")+" <b>Charged Amount</b> :  $%.2f\n"+
+				"------------------------------\n\n"+
+				em(emojiHitRate, "\xf0\x9f\x8e\xaf")+" <b>Approved Rate</b> : %.1f%%\n"+
+				em(emojiRowCard, "\xf0\x9f\x92\xb3")+" <b>Charged Rate</b>  :  %.1f%%\n"+
+				"==============================",
+			targetUID, html.EscapeString(username), creditsStr, unlimitedStr, dailyCount, limit,
+			stats.TotalChecked, stats.TotalApproved, stats.TotalDeclined, stats.TotalCharged,
+			stats.TotalChargedAmt, approvedRate, chargedRate), tele.ModeHTML)
+	})
+
 	bot.Handle("/redeem", func(c tele.Context) error {
 		uid := c.Sender().ID
-		code := strings.TrimSpace(c.Message().Payload)
-		if code == "" {
-			return c.Send("Usage: /redeem &lt;key&gt;")
+		fullText := c.Message().Text
+		fmt.Printf("[REDEEM] uid=%d text=%q\n", uid, fullText)
+		idx := strings.Index(fullText, "/redeem")
+		if idx < 0 {
+			fmt.Printf("[REDEEM] no '/redeem' found in text\n")
+			return c.Send("Usage: /redeem <key>")
 		}
+		after := strings.TrimSpace(fullText[idx+len("/redeem"):])
+		if strings.HasPrefix(after, "@") {
+			if sp := strings.IndexByte(after, ' '); sp >= 0 {
+				after = strings.TrimSpace(after[sp:])
+			} else {
+				after = ""
+			}
+		}
+		if after == "" {
+			fmt.Printf("[REDEEM] empty key after parse\n")
+			return c.Send("Usage: /redeem <key>")
+		}
+		code := after
+		fmt.Printf("[REDEEM] parsed code=%q\n", code)
 		um.SetUsername(uid, c.Sender().Username)
 		key, err := km.Redeem(code, uid)
 		if err != nil {
+			fmt.Printf("[REDEEM] Redeem() error: %v\n", err)
 			return c.Send(em(emojiCross, "\xe2\x9c\x85")+" "+err.Error(), tele.ModeHTML)
 		}
+		fmt.Printf("[REDEEM] success type=%s code=%s\n", key.Type, key.Code)
 		if key.Type == "credits" {
 			um.AddCredits(uid, float64(key.Credits))
 			um.Save()

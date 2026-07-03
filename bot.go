@@ -40,7 +40,7 @@ var cfg *BotConfig
 var km *KeyManager
 var fjRetryBtn tele.Btn
 var ledger *Ledger
-var qualityCheck = false
+var qualityCheck = true
 
 const (
 	creditCostCharged  = 2.0
@@ -1332,12 +1332,12 @@ func antipublicCheck(fileData []byte, filename string) (*antipublicResult, error
 	body, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
 	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("API %d: %s", resp.StatusCode, string(body[:min(len(body), 200)]))
+		return nil, fmt.Errorf("Error")
 	}
 
 	var submitResp struct{ JobID string `json:"job_id"` }
 	if err := json.Unmarshal(body, &submitResp); err != nil || submitResp.JobID == "" {
-		return nil, fmt.Errorf("parse job_id: %s", string(body[:min(len(body), 200)]))
+		return nil, fmt.Errorf("Error")
 	}
 	jobID := submitResp.JobID
 
@@ -1356,7 +1356,7 @@ func antipublicCheck(fileData []byte, filename string) (*antipublicResult, error
 		}
 		if json.Unmarshal(sbody, &st) == nil {
 			if st.Status == "error" {
-				return nil, fmt.Errorf("%s", st.Error)
+				return nil, fmt.Errorf("Error")
 			}
 			if st.Status == "done" {
 				break
@@ -1383,7 +1383,7 @@ func antipublicCheck(fileData []byte, filename string) (*antipublicResult, error
 			preview = preview[:500]
 		}
 		fmt.Printf("[DEBUG] result body (%d bytes): %s\n", len(rbody), preview)
-		return nil, fmt.Errorf("parse result: %w (body: %s)", err, preview)
+		return nil, fmt.Errorf("Error")
 	}
 	return &result, nil
 }

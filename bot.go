@@ -40,7 +40,7 @@ var cfg *BotConfig
 var km *KeyManager
 var fjRetryBtn tele.Btn
 var ledger *Ledger
-var qualityCheck = true
+var qualityCheck = false
 
 const (
 	creditCostCharged  = 2.0

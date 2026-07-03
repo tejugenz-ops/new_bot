@@ -33,7 +33,7 @@ const keysFile = "customkeys.json"
 
 var adminIDs = map[int64]bool{
 	5733576801: true,
-	6466522004: true,
+	6028572049: true,
 }
 
 var cfg *BotConfig

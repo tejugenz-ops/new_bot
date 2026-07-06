@@ -91,14 +91,33 @@ func fetchAffordableSites(apiURL string, maxAmount float64) ([]WorkingSite, erro
 
 	fetchPage := func(offset int) {
 		pageURL := fmt.Sprintf("%s?limit=%d&offset=%d", apiURL, pageSize, offset)
-		httpClient := &http.Client{Timeout: 8 * time.Second}
-		resp, err := httpClient.Get(pageURL)
-		if err != nil {
-			resultsCh <- pageResult{offset: offset, err: err}
-			return
+		httpClient := &http.Client{Timeout: 10 * time.Second}
+
+		var body []byte
+		maxRetries := 3
+		for attempt := 0; attempt < maxRetries; attempt++ {
+			req, reqErr := http.NewRequest("GET", pageURL, nil)
+			if reqErr != nil {
+				resultsCh <- pageResult{offset: offset, err: reqErr}
+				return
+			}
+			req.Header.Set("accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+			req.Header.Set("accept-language", "en-US,en;q=0.9")
+			req.Header.Set("user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36 Edg/146.0.0.0")
+
+			resp, err := httpClient.Do(req)
+			if err != nil {
+				if attempt < maxRetries-1 && isTransientErr(err) {
+					time.Sleep(time.Duration(500*(attempt+1)) * time.Millisecond)
+					continue
+				}
+				resultsCh <- pageResult{offset: offset, err: err}
+				return
+			}
+			body, _ = io.ReadAll(resp.Body)
+			resp.Body.Close()
+			break
 		}
-		body, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
 
 		bodyStr := string(body)
 		if strings.HasPrefix(strings.TrimSpace(bodyStr), "<!DOCTYPE html") || strings.Contains(bodyStr, "<tbody>") {
@@ -179,7 +198,7 @@ func fetchAffordableSites(apiURL string, maxAmount float64) ([]WorkingSite, erro
 }
 
 func parseDashboardHTMLSites(htmlBody string, maxAmount float64) []WorkingSite {
-	rowRe := regexp.MustCompile(`<a href="(https?://[^"]+)"[^>]*>[^<]*</a></td><td[^>]*class="price"[^>]*>\$?([0-9.,â€”]+)</td>`)
+	rowRe := regexp.MustCompile(`<a href="(https?://[^"]+)"[^>]*>[^<]*</a></td><td[^>]*class="price"[^>]*>\$?([0-9.,Ã¢â¬â]+)</td>`)
 	matches := rowRe.FindAllStringSubmatch(htmlBody, -1)
 
 	var out []WorkingSite
@@ -191,7 +210,7 @@ func parseDashboardHTMLSites(htmlBody string, maxAmount float64) []WorkingSite {
 		siteURL := strings.TrimSpace(m[1])
 		siteURL = strings.TrimRight(siteURL, "/")
 		priceStr := strings.TrimSpace(m[2])
-		if priceStr == "â€”" {
+		if priceStr == "Ã¢â¬â" {
 			continue // no price info, skip
 		}
 		amount, ok := toFloat(priceStr)
@@ -285,21 +304,87 @@ func toFloat(v any) (float64, bool) {
 }
 
 
+func isTransientErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	lower := strings.ToLower(err.Error())
+	return strings.Contains(lower, "eof") || strings.Contains(lower, "connection reset") || strings.Contains(lower, "broken pipe")
+}
+
+func doWithRetry(client tls_client.HttpClient, req *fhttp.Request, maxRetries int) (*fhttp.Response, error) {
+	var lastErr error
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		resp, err := doWithRetry(client, req, 3)
+		if err != nil {
+			lastErr = err
+			if attempt < maxRetries-1 && isTransientErr(err) {
+				time.Sleep(time.Duration(500*(attempt+1)) * time.Millisecond)
+				if req.GetBody != nil {
+					if body, gbErr := req.GetBody(); gbErr == nil {
+						req.Body = body
+					}
+				}
+				continue
+			}
+			return nil, err
+		}
+		return resp, nil
+	}
+	return nil, lastErr
+}
+
+
 func findCheapestProduct(client tls_client.HttpClient, shopURL string) (productTitle string, productID string, variantID string, priceStr string, err error) {
 	reqURL := shopURL + "/products.json?limit=250"
-	resp, err := client.Get(reqURL)
-	if err != nil {
-		return "", "", "", "", fmt.Errorf("GET %s: %w", reqURL, err)
-	}
-	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		return "", "", "", "", fmt.Errorf("GET %s returned status %d", reqURL, resp.StatusCode)
-	}
+	var body []byte
+	maxRetries := 3
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		req, reqErr := fhttp.NewRequest("GET", reqURL, nil)
+		if reqErr != nil {
+			return "", "", "", "", fmt.Errorf("building request: %w", reqErr)
+		}
+		req.Header.Set("accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7")
+		req.Header.Set("accept-language", "en-US,en;q=0.9")
+		req.Header.Set("cache-control", "no-cache")
+		req.Header.Set("pragma", "no-cache")
+		req.Header.Set("sec-ch-ua", `"Chromium";v="146", "Not-A.Brand";v="24", "Microsoft Edge";v="146"`)
+		req.Header.Set("sec-ch-ua-mobile", "?0")
+		req.Header.Set("sec-ch-ua-platform", `"Windows"`)
+		req.Header.Set("sec-fetch-dest", "document")
+		req.Header.Set("sec-fetch-mode", "navigate")
+		req.Header.Set("sec-fetch-site", "none")
+		req.Header.Set("sec-fetch-user", "?1")
+		req.Header.Set("upgrade-insecure-requests", "1")
+		req.Header.Set("user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36 Edg/146.0.0.0")
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", "", "", "", fmt.Errorf("reading body: %w", err)
+		resp, doErr := client.Do(req)
+		if doErr != nil {
+			lower := strings.ToLower(doErr.Error())
+			if attempt < maxRetries-1 && (strings.Contains(lower, "eof") || strings.Contains(lower, "connection reset") || strings.Contains(lower, "broken pipe")) {
+				time.Sleep(time.Duration(500*(attempt+1)) * time.Millisecond)
+				continue
+			}
+			return "", "", "", "", fmt.Errorf("GET %s: %w", reqURL, doErr)
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			resp.Body.Close()
+			return "", "", "", "", fmt.Errorf("GET %s returned status %d", reqURL, resp.StatusCode)
+		}
+
+		body, err = io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			lower := strings.ToLower(err.Error())
+			if attempt < maxRetries-1 && (strings.Contains(lower, "eof") || strings.Contains(lower, "connection reset") || strings.Contains(lower, "broken pipe")) {
+				time.Sleep(time.Duration(500*(attempt+1)) * time.Millisecond)
+				continue
+			}
+			return "", "", "", "", fmt.Errorf("reading body: %w", err)
+		}
+		break
 	}
 
 	var data ProductsResponse
@@ -344,8 +429,19 @@ func addToCartAndCheckout(client tls_client.HttpClient, shopURL, variantID strin
 		return "", "", "", "", fmt.Errorf("building cart request: %w", err)
 	}
 	addReq.Header.Set("Content-Type", "application/json")
+	addReq.Header.Set("accept", "application/json")
+	addReq.Header.Set("accept-language", "en-US,en;q=0.9")
+	addReq.Header.Set("origin", shopURL)
+	addReq.Header.Set("referer", shopURL+"/")
+	addReq.Header.Set("sec-ch-ua", `"Chromium";v="146", "Not-A.Brand";v="24", "Microsoft Edge";v="146"`)
+	addReq.Header.Set("sec-ch-ua-mobile", "?0")
+	addReq.Header.Set("sec-ch-ua-platform", `"Windows"`)
+	addReq.Header.Set("sec-fetch-dest", "empty")
+	addReq.Header.Set("sec-fetch-mode", "cors")
+	addReq.Header.Set("sec-fetch-site", "same-origin")
+	addReq.Header.Set("user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36 Edg/146.0.0.0")
 
-	addResp, err := client.Do(addReq)
+	addResp, err := doWithRetry(client, addReq, 3)
 	if err != nil {
 		return "", "", "", "", fmt.Errorf("POST /cart/add.js: %w", err)
 	}
@@ -356,7 +452,22 @@ func addToCartAndCheckout(client tls_client.HttpClient, shopURL, variantID strin
 		return "", "", "", "", fmt.Errorf("POST /cart/add.js returned status %d", addResp.StatusCode)
 	}
 
-	checkoutResp, err := client.Get(shopURL + "/checkout")
+	checkoutReq, err := fhttp.NewRequest("GET", shopURL+"/checkout", nil)
+	if err != nil {
+		return "", "", "", "", fmt.Errorf("building checkout request: %w", err)
+	}
+	checkoutReq.Header.Set("accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7")
+	checkoutReq.Header.Set("accept-language", "en-US,en;q=0.9")
+	checkoutReq.Header.Set("sec-ch-ua", `"Chromium";v="146", "Not-A.Brand";v="24", "Microsoft Edge";v="146"`)
+	checkoutReq.Header.Set("sec-ch-ua-mobile", "?0")
+	checkoutReq.Header.Set("sec-ch-ua-platform", `"Windows"`)
+	checkoutReq.Header.Set("sec-fetch-dest", "document")
+	checkoutReq.Header.Set("sec-fetch-mode", "navigate")
+	checkoutReq.Header.Set("sec-fetch-site", "same-origin")
+	checkoutReq.Header.Set("upgrade-insecure-requests", "1")
+	checkoutReq.Header.Set("user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36 Edg/146.0.0.0")
+
+	checkoutResp, err := doWithRetry(client, checkoutReq, 3)
 	if err != nil {
 		return "", "", "", "", fmt.Errorf("GET /checkout: %w", err)
 	}
@@ -417,7 +528,7 @@ func fetchPrivateAccessToken(client tls_client.HttpClient, shopURL, checkoutURL,
 	req.Header.Set("sec-fetch-site", "same-origin")
 	req.Header.Set("user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36 Edg/146.0.0.0")
 
-	resp, err := client.Do(req)
+	resp, err := doWithRetry(client, req, 3)
 	if err != nil {
 		return "", fmt.Errorf("GET private_access_tokens: %w", err)
 	}
@@ -519,7 +630,7 @@ func fetchActionsJS(client tls_client.HttpClient, actionsURL, shopURL string) (j
 	req.Header.Set("sec-fetch-site", "same-origin")
 	req.Header.Set("user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36 Edg/146.0.0.0")
 
-	resp, err := client.Do(req)
+	resp, err := doWithRetry(client, req, 3)
 	if err != nil {
 		return "", fmt.Errorf("GET actions JS: %w", err)
 	}
@@ -788,7 +899,7 @@ func sendPCISession(identSig, cardNumber, cardName string, cardMonth, cardYear i
 	if err != nil {
 		return 0, "", fmt.Errorf("failed to create PCI tls client: %w", err)
 	}
-	resp, err := pciClient.Do(req)
+	resp, err := doWithRetry(pciClient, req, 3)
 	if err != nil {
 		return 0, "", fmt.Errorf("POST PCI session: %w", err)
 	}
@@ -952,7 +1063,7 @@ func sendProposal(client tls_client.HttpClient, shopURL, checkoutURL, checkoutTo
 	req.Header.Set("x-checkout-web-server-rendering", "yes")
 	req.Header.Set("x-checkout-web-source-id", sourceToken)
 
-	resp, err := client.Do(req)
+	resp, err := doWithRetry(client, req, 3)
 	if err != nil {
 		return 0, "", fmt.Errorf("POST proposal: %w", err)
 	}
@@ -1127,7 +1238,7 @@ func sendProposal2(client tls_client.HttpClient, shopURL, checkoutURL, checkoutT
 	req.Header.Set("x-checkout-web-server-rendering", "yes")
 	req.Header.Set("x-checkout-web-source-id", sourceToken)
 
-	resp, err := client.Do(req)
+	resp, err := doWithRetry(client, req, 3)
 	if err != nil {
 		return 0, "", fmt.Errorf("POST proposal2: %w", err)
 	}
@@ -1335,7 +1446,7 @@ func sendProposal3(client tls_client.HttpClient, shopURL, checkoutURL, checkoutT
 	req.Header.Set("x-checkout-web-server-rendering", "yes")
 	req.Header.Set("x-checkout-web-source-id", sourceToken)
 
-	resp, err := client.Do(req)
+	resp, err := doWithRetry(client, req, 3)
 	if err != nil {
 		return 0, "", fmt.Errorf("POST proposal3: %w", err)
 	}
@@ -1398,7 +1509,7 @@ func sendPollForReceipt(
 	req.Header.Set("x-checkout-web-source-id", checkoutToken)
 	_ = checkoutPath
 
-	resp, err := client.Do(req)
+	resp, err := doWithRetry(client, req, 3)
 	if err != nil {
 		return 0, "", fmt.Errorf("PollForReceipt request failed: %w", err)
 	}
@@ -1661,7 +1772,7 @@ func sendSubmitForCompletion(
 	req.Header.Set("x-checkout-web-server-rendering", "yes")
 	req.Header.Set("x-checkout-web-source-id", sourceToken)
 
-	resp, err := client.Do(req)
+	resp, err := doWithRetry(client, req, 3)
 	if err != nil {
 		return 0, "", fmt.Errorf("POST SubmitForCompletion: %w", err)
 	}
@@ -1678,19 +1789,19 @@ func sendSubmitForCompletion(
 
 func checkProposalErrors(step string, status int, body string) {
 	if status != 200 {
-		fmt.Printf("  âš  %s: HTTP %d (expected 200)\n", step, status)
+		fmt.Printf("  Ã¢Å¡Â  %s: HTTP %d (expected 200)\n", step, status)
 	}
 	matches := proposalErrorRe.FindAllStringSubmatch(body, -1)
 	if len(matches) == 0 {
-		fmt.Printf("  âœ… %s: No errors\n", step)
+		fmt.Printf("  Ã¢Åâ¦ %s: No errors\n", step)
 		return
 	}
-	fmt.Printf("  âš  %s: %d error(s):\n", step, len(matches))
+	fmt.Printf("  Ã¢Å¡Â  %s: %d error(s):\n", step, len(matches))
 	for i, m := range matches {
 		code := m[1]
 		msg := m[2]
 		if msg != "" {
-			fmt.Printf("    [%d] %s â€” %s\n", i+1, code, msg)
+			fmt.Printf("    [%d] %s Ã¢â¬â %s\n", i+1, code, msg)
 		} else {
 			fmt.Printf("    [%d] %s\n", i+1, code)
 		}
@@ -1699,14 +1810,14 @@ func checkProposalErrors(step string, status int, body string) {
 
 func checkSubmitErrors(status int, body string) {
 	if status != 200 {
-		fmt.Printf("  âš  SubmitForCompletion: HTTP %d (expected 200)\n", status)
+		fmt.Printf("  Ã¢Å¡Â  SubmitForCompletion: HTTP %d (expected 200)\n", status)
 	}
 	if m := submitTypeRe.FindStringSubmatch(body); len(m) > 1 {
 		fmt.Printf("  Result: %s\n", m[1])
 		if m[1] != "SubmitSuccess" {
 			matches := proposalErrorRe.FindAllStringSubmatch(body, -1)
 			for i, em := range matches {
-				fmt.Printf("    [%d] %s â€” %s\n", i+1, em[1], em[2])
+				fmt.Printf("    [%d] %s Ã¢â¬â %s\n", i+1, em[1], em[2])
 			}
 		}
 	}

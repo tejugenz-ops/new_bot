@@ -1668,7 +1668,6 @@ func runSession(bot *tele.Bot, chat *tele.Chat, sess *CheckSession, proxies []st
 					return
 				}
 				if attempt > 0 {
-					time.Sleep(500 * time.Millisecond)
 					si = (si + 1) % len(sites)
 					shopURL = sites[si]
 				}

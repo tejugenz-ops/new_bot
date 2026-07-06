@@ -31,6 +31,7 @@ var usersFile = "users.json"
 var configFile = "botconfig.json"
 var sitesFile = "customsites.json"
 var keysFile = "customkeys.json"
+var blacklistFile = "blacklist.json"
 
 func resolveDataDir() string {
 	candidates := []string{"/data", "./data"}
@@ -49,6 +50,7 @@ func init() {
 		configFile = filepath.Join(dataDir, "botconfig.json")
 		sitesFile = filepath.Join(dataDir, "customsites.json")
 		keysFile = filepath.Join(dataDir, "customkeys.json")
+		blacklistFile = filepath.Join(dataDir, "blacklist.json")
 		fmt.Printf("[DATA] using data directory: %s\n", dataDir)
 	}
 }
@@ -839,9 +841,35 @@ func isBlacklisted(site string) bool {
 
 func blacklistSite(site string) {
 	blacklistMu.Lock()
-	defer blacklistMu.Unlock()
 	blacklisted[site] = true
-	fmt.Printf("[BLACKLIST] test store detected, blacklisted: %s\n", site)
+	blacklistMu.Unlock()
+	saveBlacklist()
+	fmt.Printf("[BLACKLIST] site blacklisted: %s\n", site)
+}
+
+func loadBlacklist() {
+	data, err := os.ReadFile(blacklistFile)
+	if err != nil {
+		return
+	}
+	blacklistMu.Lock()
+	defer blacklistMu.Unlock()
+	json.Unmarshal(data, &blacklisted)
+	fmt.Printf("[BLACKLIST] loaded %d blacklisted sites\n", len(blacklisted))
+}
+
+func saveBlacklist() {
+	blacklistMu.RLock()
+	sites := make([]string, 0, len(blacklisted))
+	for s := range blacklisted {
+		sites = append(sites, s)
+	}
+	blacklistMu.RUnlock()
+	data, _ := json.MarshalIndent(sites, "", "  ")
+	tmp := blacklistFile + ".tmp"
+	if err := os.WriteFile(tmp, data, 0644); err == nil {
+		os.Rename(tmp, blacklistFile)
+	}
 }
 
 func loadCustomSites() {
@@ -1671,6 +1699,9 @@ func runSession(bot *tele.Bot, chat *tele.Chat, sess *CheckSession, proxies []st
 					si = (si + 1) % len(sites)
 					shopURL = sites[si]
 				}
+				if isBlacklisted(shopURL) {
+					continue
+				}
 				res, lastErr = runCheckoutForCard(shopURL, c, proxyURL)
 				if lastErr == nil {
 					break
@@ -1803,6 +1834,7 @@ func main() {
 	km.Load()
 
 	loadCustomSites()
+	loadBlacklist()
 
 	sitePoolMu.Lock()
 	sitePool = []string{defaultShopURL}

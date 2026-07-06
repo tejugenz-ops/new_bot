@@ -796,7 +796,7 @@ func (s *CheckSession) ChargedAmt() float64 {
 
 func (s *CheckSession) addErrorCard(card, errMsg string) {
 	s.errorCardsMu.Lock()
-	s.errorCards = append(s.errorCards, card+" -> "+errMsg)
+	s.errorCards = append(s.errorCards, card)
 	s.errorCardsMu.Unlock()
 }
 

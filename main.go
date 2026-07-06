@@ -315,7 +315,7 @@ func isTransientErr(err error) bool {
 func doWithRetry(client tls_client.HttpClient, req *fhttp.Request, maxRetries int) (*fhttp.Response, error) {
 	var lastErr error
 	for attempt := 0; attempt < maxRetries; attempt++ {
-		resp, err := doWithRetry(client, req, 2)
+		resp, err := client.Do(req)
 		if err != nil {
 			lastErr = err
 			if attempt < maxRetries-1 && isTransientErr(err) {

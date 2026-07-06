@@ -191,7 +191,7 @@ func normalizeProxy(raw string) (string, error) {
 
 func testProxy(proxyURL string) error {
 	options := []tls_client.HttpClientOption{
-		tls_client.WithTimeoutSeconds(5),
+		tls_client.WithTimeoutSeconds(10),
 		tls_client.WithClientProfile(profiles.Chrome_124),
 		tls_client.WithProxyUrl(proxyURL),
 	}
@@ -200,7 +200,7 @@ func testProxy(proxyURL string) error {
 		return fmt.Errorf("create proxy test client: %w", err)
 	}
 
-	resp, err := client.Get("https://api.ipify.org?format=json")
+	resp, err := client.Get("http://httpbin.org/ip")
 	if err != nil {
 		return fmt.Errorf("proxy test request failed: %w", err)
 	}
@@ -219,39 +219,6 @@ func testProxy(proxyURL string) error {
 	}
 
 	return nil
-}
-
-func findWorkingProxies(proxies []string) ([]string, error) {
-	working := make([]string, 0, len(proxies))
-	seen := make(map[string]bool)
-
-	for i, raw := range proxies {
-		proxyURL, err := normalizeProxy(raw)
-		if err != nil {
-			fmt.Printf("[Proxy %d/%d] Invalid entry skipped: %v\n", i+1, len(proxies), err)
-			continue
-		}
-		if seen[proxyURL] {
-			fmt.Printf("[Proxy %d/%d] Duplicate skipped: %s\n", i+1, len(proxies), proxyURL)
-			continue
-		}
-
-		fmt.Printf("[Proxy %d/%d] Testing %s\n", i+1, len(proxies), proxyURL)
-		if err := testProxy(proxyURL); err != nil {
-			fmt.Printf("[Proxy %d/%d] Failed: %v\n", i+1, len(proxies), err)
-			continue
-		}
-
-		seen[proxyURL] = true
-		working = append(working, proxyURL)
-		fmt.Printf("[Proxy %d/%d] OK, added to rotation.\n", i+1, len(proxies))
-	}
-
-	if len(working) == 0 {
-		return nil, fmt.Errorf("no working proxy found")
-	}
-
-	return working, nil
 }
 
 func runCheckoutForCard(shopURL, cardEntry, proxyURL string) (*CheckResult, error) {

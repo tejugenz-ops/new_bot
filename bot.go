@@ -1536,6 +1536,40 @@ func notifyLogsGroup(bot *tele.Bot, username, gateway string) {
 
 
 
+func validateProxies(proxies []string) []string {
+	type proxyResult struct {
+		idx int
+		ok  bool
+	}
+	results := make(chan proxyResult, len(proxies))
+	var wg sync.WaitGroup
+	for i, p := range proxies {
+		wg.Add(1)
+		go func(idx int, proxyURL string) {
+			defer wg.Done()
+			err := testProxy(proxyURL)
+			results <- proxyResult{idx: idx, ok: err == nil}
+		}(i, p)
+	}
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+	okMap := make(map[int]bool, len(proxies))
+	for r := range results {
+		okMap[r.idx] = r.ok
+	}
+	var working []string
+	for i, p := range proxies {
+		if okMap[i] {
+			working = append(working, p)
+		}
+	}
+	fmt.Printf("[PROXY] validated %d proxies, %d working\n", len(proxies), len(working))
+	return working
+}
+
+
 func runSession(bot *tele.Bot, chat *tele.Chat, sess *CheckSession, proxies []string, um *UserManager) {
 	defer func() {
 		if val, ok := activeSessions.Load(sess.UserID); ok && val.(*CheckSession) == sess {
@@ -1634,6 +1668,7 @@ func runSession(bot *tele.Bot, chat *tele.Chat, sess *CheckSession, proxies []st
 					return
 				}
 				if attempt > 0 {
+					time.Sleep(500 * time.Millisecond)
 					si = (si + 1) % len(sites)
 					shopURL = sites[si]
 				}
@@ -1948,6 +1983,20 @@ isPrivate := c.Chat().Type == tele.ChatPrivate
 		proxies := make([]string, len(ud.Proxies))
 		copy(proxies, ud.Proxies)
 
+		validMsg, _ := bot.Send(c.Chat(), em(emojiSearch, "\xf0\x9f\x94\x8d")+fmt.Sprintf(" Validating %d proxy(s)...", len(proxies)), tele.ModeHTML)
+		proxies = validateProxies(proxies)
+		if len(proxies) == 0 {
+			bot.Edit(validMsg, em(emojiCross, "\xe2\x9c\x85")+" No working proxies found. All proxies failed validation. Please fix your proxies with /setpr and try again.", tele.ModeHTML)
+			activeSessions.Delete(uid)
+			return nil
+		}
+		bot.Edit(validMsg, em(emojiCheck, "\xe2\x9c\x85")+fmt.Sprintf(" %d working proxy(s). Starting check...", len(proxies)), tele.ModeHTML)
+
+		if len(proxies) < len(ud.Proxies) {
+			ud.Proxies = proxies
+			um.Save()
+		}
+
 		go runSession(bot, c.Chat(), sess, proxies, um)
 
 		return nil
@@ -2116,6 +2165,20 @@ isPrivate := c.Chat().Type == tele.ChatPrivate
 		ud := um.Get(uid)
 		proxies := make([]string, len(ud.Proxies))
 		copy(proxies, ud.Proxies)
+		validMsg, _ := c.Send(em(emojiSearch, "\xf0\x9f\x94\x8d")+fmt.Sprintf(" Validating %d proxy(s)...", len(proxies)), tele.ModeHTML)
+		proxies = validateProxies(proxies)
+		if len(proxies) == 0 {
+			bot.Edit(validMsg, em(emojiCross, "\xe2\x9c\x85")+" No working proxies found. All proxies failed validation. Please fix your proxies with /setpr and try again.", tele.ModeHTML)
+			activeSessions.Delete(uid)
+			return nil
+		}
+		bot.Edit(validMsg, em(emojiCheck, "\xe2\x9c\x85")+fmt.Sprintf(" %d working proxy(s). Starting check...", len(proxies)), tele.ModeHTML)
+
+		if len(proxies) < len(ud.Proxies) {
+			ud.Proxies = proxies
+			um.Save()
+		}
+
 		c.Send(em(emojiLightning, "\xe2\x9c\x85")+fmt.Sprintf(" Starting check of %d cards (approved: ON)", len(pd.Cards)), tele.ModeHTML)
 		if pd.CheckFn != nil {
 			sess.GatewayName = pd.GateName
@@ -2161,6 +2224,20 @@ isPrivate := c.Chat().Type == tele.ChatPrivate
 		ud := um.Get(uid)
 		proxies := make([]string, len(ud.Proxies))
 		copy(proxies, ud.Proxies)
+		validMsg, _ := c.Send(em(emojiSearch, "\xf0\x9f\x94\x8d")+fmt.Sprintf(" Validating %d proxy(s)...", len(proxies)), tele.ModeHTML)
+		proxies = validateProxies(proxies)
+		if len(proxies) == 0 {
+			bot.Edit(validMsg, em(emojiCross, "\xe2\x9c\x85")+" No working proxies found. All proxies failed validation. Please fix your proxies with /setpr and try again.", tele.ModeHTML)
+			activeSessions.Delete(uid)
+			return nil
+		}
+		bot.Edit(validMsg, em(emojiCheck, "\xe2\x9c\x85")+fmt.Sprintf(" %d working proxy(s). Starting check...", len(proxies)), tele.ModeHTML)
+
+		if len(proxies) < len(ud.Proxies) {
+			ud.Proxies = proxies
+			um.Save()
+		}
+
 		c.Send(em(emojiLightning, "\xe2\x9c\x85")+fmt.Sprintf(" Starting check of %d cards (approved: OFF)", len(pd.Cards)), tele.ModeHTML)
 		if pd.CheckFn != nil {
 			sess.GatewayName = pd.GateName

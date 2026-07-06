@@ -2165,7 +2165,7 @@ isPrivate := c.Chat().Type == tele.ChatPrivate
 		ud := um.Get(uid)
 		proxies := make([]string, len(ud.Proxies))
 		copy(proxies, ud.Proxies)
-		validMsg, _ := c.Send(em(emojiSearch, "\xf0\x9f\x94\x8d")+fmt.Sprintf(" Validating %d proxy(s)...", len(proxies)), tele.ModeHTML)
+		validMsg, _ := bot.Send(c.Chat(), em(emojiSearch, "\xf0\x9f\x94\x8d")+fmt.Sprintf(" Validating %d proxy(s)...", len(proxies)), tele.ModeHTML)
 		proxies = validateProxies(proxies)
 		if len(proxies) == 0 {
 			bot.Edit(validMsg, em(emojiCross, "\xe2\x9c\x85")+" No working proxies found. All proxies failed validation. Please fix your proxies with /setpr and try again.", tele.ModeHTML)
@@ -2224,7 +2224,7 @@ isPrivate := c.Chat().Type == tele.ChatPrivate
 		ud := um.Get(uid)
 		proxies := make([]string, len(ud.Proxies))
 		copy(proxies, ud.Proxies)
-		validMsg, _ := c.Send(em(emojiSearch, "\xf0\x9f\x94\x8d")+fmt.Sprintf(" Validating %d proxy(s)...", len(proxies)), tele.ModeHTML)
+		validMsg, _ := bot.Send(c.Chat(), em(emojiSearch, "\xf0\x9f\x94\x8d")+fmt.Sprintf(" Validating %d proxy(s)...", len(proxies)), tele.ModeHTML)
 		proxies = validateProxies(proxies)
 		if len(proxies) == 0 {
 			bot.Edit(validMsg, em(emojiCross, "\xe2\x9c\x85")+" No working proxies found. All proxies failed validation. Please fix your proxies with /setpr and try again.", tele.ModeHTML)

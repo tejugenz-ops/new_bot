@@ -775,6 +775,9 @@ type CheckSession struct {
 	chargedAmtMu sync.Mutex
 	chargedAmt   float64
 
+	errorCardsMu sync.Mutex
+	errorCards   []string
+
 	outputMu sync.Mutex
 	ledger   *Ledger
 }
@@ -789,6 +792,32 @@ func (s *CheckSession) ChargedAmt() float64 {
 	s.chargedAmtMu.Lock()
 	defer s.chargedAmtMu.Unlock()
 	return s.chargedAmt
+}
+
+func (s *CheckSession) addErrorCard(card, errMsg string) {
+	s.errorCardsMu.Lock()
+	s.errorCards = append(s.errorCards, card+" -> "+errMsg)
+	s.errorCardsMu.Unlock()
+}
+
+func sendErrorCards(bot *tele.Bot, chat *tele.Chat, sess *CheckSession) {
+	sess.errorCardsMu.Lock()
+	if len(sess.errorCards) == 0 {
+		sess.errorCardsMu.Unlock()
+		return
+	}
+	cards := make([]string, len(sess.errorCards))
+	copy(cards, sess.errorCards)
+	sess.errorCardsMu.Unlock()
+
+	text := strings.Join(cards, "\n")
+	buf := bytes.NewBufferString(text)
+	doc := &tele.Document{
+		File:     tele.FromReader(buf),
+		FileName: "error_cards.txt",
+		Caption:  fmt.Sprintf("%d error card(s) returned for recheck", len(cards)),
+	}
+	bot.Send(chat, doc)
 }
 
 func generateSessionID() string {
@@ -1742,6 +1771,7 @@ func runSession(bot *tele.Bot, chat *tele.Chat, sess *CheckSession, proxies []st
 		r := cr.result
 		if r == nil {
 			sess.Errors.Add(1)
+			sess.addErrorCard(cr.card, fmt.Sprintf("nil result: %v", cr.err))
 			fmt.Printf("[ERROR] card returned nil result, err: %v\n", cr.err)
 			continue
 		}
@@ -1750,6 +1780,7 @@ func runSession(bot *tele.Bot, chat *tele.Chat, sess *CheckSession, proxies []st
 		case StatusCharged:
 			if cr.shopURL != "" && isBlacklisted(cr.shopURL) {
 				sess.Errors.Add(1)
+				sess.addErrorCard(r.Card, "blacklisted shop: "+cr.shopURL)
 				continue
 			}
 			if cr.shopURL != "" {
@@ -1760,6 +1791,7 @@ func runSession(bot *tele.Bot, chat *tele.Chat, sess *CheckSession, proxies []st
 					blacklistSite(cr.shopURL)
 					bot.Send(chat, fmt.Sprintf("s Test store detected & blacklisted: %s", cr.shopURL))
 					sess.Errors.Add(1)
+					sess.addErrorCard(r.Card, "test store: "+cr.shopURL)
 					continue
 				}
 			}
@@ -1767,6 +1799,7 @@ func runSession(bot *tele.Bot, chat *tele.Chat, sess *CheckSession, proxies []st
 			handle := sess.ledger.settle(bot, chat, sess, um, formatChargedMsg(r.Card, bin, r, username), username, r, needsCredits)
 			if handle == 0 {
 				sess.Errors.Add(1)
+				sess.addErrorCard(r.Card, "settle failed")
 				continue
 			}
 
@@ -1789,6 +1822,7 @@ func runSession(bot *tele.Bot, chat *tele.Chat, sess *CheckSession, proxies []st
 
 		default:
 			sess.Errors.Add(1)
+			sess.addErrorCard(r.Card, fmt.Sprintf("%v", r.Error))
 			fmt.Printf("[ERROR] card %s status=%d err=%v\n", r.Card, r.Status, r.Error)
 		}
 
@@ -1812,6 +1846,8 @@ func runSession(bot *tele.Bot, chat *tele.Chat, sess *CheckSession, proxies []st
 	if insufficientCredits {
 		sendRemainingCards(bot, chat, sess, processedCards)
 	}
+
+	sendErrorCards(bot, chat, sess)
 
 	ud := um.Get(sess.UserID)
 	ud.Stats.TotalChecked += sess.Checked.Load()

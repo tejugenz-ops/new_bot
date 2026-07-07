@@ -276,7 +276,6 @@ func runCheckoutForCard(shopURL, cardEntry, proxyURL string) (*CheckResult, erro
 	buildID := extractCommitSha(checkoutHTML)
 	sourceToken := extractSourceToken(checkoutHTML)
 	if stableID == "" || buildID == "" || sourceToken == "" {
-		blacklistSite(shopURL)
 		saveDebugResponse("checkout_html_step1", checkoutHTML)
 		fmt.Printf("  [ERR] Step1 missing: stableID=%v buildID=%v sourceToken=%v shop=%s\n",
 			stableID != "", buildID != "", sourceToken != "", shopURL)
@@ -451,7 +450,6 @@ func runCheckoutForCard(shopURL, cardEntry, proxyURL string) (*CheckResult, erro
 
 	pciSessionID := extractPCISessionID(pciBody)
 	if pciSessionID == "" {
-		blacklistSite(shopURL)
 		result.Status = StatusError
 		result.Retryable = true
 		result.Error = fmt.Errorf("Step 9 failed: could not extract session ID (shop=%s)", shopURL)
@@ -517,7 +515,6 @@ func runCheckoutForCard(shopURL, cardEntry, proxyURL string) (*CheckResult, erro
 
 	receiptID := extractReceiptID(submitBody)
 	if receiptID == "" {
-		blacklistSite(shopURL)
 		result.Status = StatusError
 		result.Error = fmt.Errorf("%w: Step 10 failed: could not extract receiptId (shop=%s)", errMissingReceiptID, shopURL)
 		result.Retryable = true

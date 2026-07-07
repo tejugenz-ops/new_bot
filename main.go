@@ -1851,3 +1851,4 @@ func extractReceiptStatusCode(pollBody, receiptType string) string {
 
 	return "UNKNOWN"
 }
+

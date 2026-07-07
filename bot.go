@@ -31,7 +31,6 @@ var usersFile = "users.json"
 var configFile = "botconfig.json"
 var sitesFile = "customsites.json"
 var keysFile = "customkeys.json"
-var blacklistFile = "blacklist.json"
 
 func resolveDataDir() string {
 	candidates := []string{"/data", "./data"}
@@ -50,7 +49,6 @@ func init() {
 		configFile = filepath.Join(dataDir, "botconfig.json")
 		sitesFile = filepath.Join(dataDir, "customsites.json")
 		keysFile = filepath.Join(dataDir, "customkeys.json")
-		blacklistFile = filepath.Join(dataDir, "blacklist.json")
 		fmt.Printf("[DATA] using data directory: %s\n", dataDir)
 	}
 }
@@ -857,50 +855,6 @@ var (
 )
 
 
-var (
-	blacklistMu sync.RWMutex
-	blacklisted = make(map[string]bool)
-)
-
-func isBlacklisted(site string) bool {
-	blacklistMu.RLock()
-	defer blacklistMu.RUnlock()
-	return blacklisted[site]
-}
-
-func blacklistSite(site string) {
-	blacklistMu.Lock()
-	blacklisted[site] = true
-	blacklistMu.Unlock()
-	saveBlacklist()
-	fmt.Printf("[BLACKLIST] site blacklisted: %s\n", site)
-}
-
-func loadBlacklist() {
-	data, err := os.ReadFile(blacklistFile)
-	if err != nil {
-		return
-	}
-	blacklistMu.Lock()
-	defer blacklistMu.Unlock()
-	json.Unmarshal(data, &blacklisted)
-	fmt.Printf("[BLACKLIST] loaded %d blacklisted sites\n", len(blacklisted))
-}
-
-func saveBlacklist() {
-	blacklistMu.RLock()
-	sites := make([]string, 0, len(blacklisted))
-	for s := range blacklisted {
-		sites = append(sites, s)
-	}
-	blacklistMu.RUnlock()
-	data, _ := json.MarshalIndent(sites, "", "  ")
-	tmp := blacklistFile + ".tmp"
-	if err := os.WriteFile(tmp, data, 0644); err == nil {
-		os.Rename(tmp, blacklistFile)
-	}
-}
-
 func loadCustomSites() {
 	data, err := os.ReadFile(sitesFile)
 	if err != nil {
@@ -979,13 +933,7 @@ func getSitePool() []string {
 		copy(raw, sitePool)
 		sitePoolMu.RUnlock()
 	}
-	filtered := make([]string, 0, len(raw))
-	for _, s := range raw {
-		if !isBlacklisted(s) {
-			filtered = append(filtered, s)
-		}
-	}
-	return filtered
+	return raw
 }
 
 
@@ -1728,9 +1676,6 @@ func runSession(bot *tele.Bot, chat *tele.Chat, sess *CheckSession, proxies []st
 					si = (si + 1) % len(sites)
 					shopURL = sites[si]
 				}
-				if isBlacklisted(shopURL) {
-					continue
-				}
 				res, lastErr = runCheckoutForCard(shopURL, c, proxyURL)
 				if lastErr == nil {
 					break
@@ -1778,18 +1723,12 @@ func runSession(bot *tele.Bot, chat *tele.Chat, sess *CheckSession, proxies []st
 
 		switch r.Status {
 		case StatusCharged:
-			if cr.shopURL != "" && isBlacklisted(cr.shopURL) {
-				sess.Errors.Add(1)
-				sess.addErrorCard(r.Card, "blacklisted shop: "+cr.shopURL)
-				continue
-			}
 			if cr.shopURL != "" {
 				const verifyCard = "4147207228677008|11|28|183"
 				fmt.Printf("[VERIFY] testing %s with dead card to detect fake store\n", cr.shopURL)
 				verifyRes, _ := runCheckoutForCard(cr.shopURL, verifyCard, cr.proxyURL)
 				if verifyRes != nil && verifyRes.Status == StatusCharged {
-					blacklistSite(cr.shopURL)
-					bot.Send(chat, fmt.Sprintf("s Test store detected & blacklisted: %s", cr.shopURL))
+					bot.Send(chat, fmt.Sprintf("s Test store detected: %s", cr.shopURL))
 					sess.Errors.Add(1)
 					sess.addErrorCard(r.Card, "test store: "+cr.shopURL)
 					continue
@@ -1870,7 +1809,6 @@ func main() {
 	km.Load()
 
 	loadCustomSites()
-	loadBlacklist()
 
 	sitePoolMu.Lock()
 	sitePool = []string{defaultShopURL}
@@ -2927,10 +2865,8 @@ bot.Handle("/admin", func(c tele.Context) error {
 				em("5039614900280754969", "\xe2\x9c\x85") + " <b>Site Management</b>\n" +
 				"-> " + em("5352585602317426381", "\xe2\x9c\x85") + " /addsite &lt;url&gt;  - Add site\n" +
 				"-> " + em("5039649904264217620", "\xe2\x9c\x85") + " /rmsite &lt;url&gt;   - Remove site\n" +
-				"-> " + em("5039600026809009149", "\xe2\x9c\x85") + " /blacklistsite  - Blacklist site\n" +
 				"-> " + em("5447644880824181073", "\xe2\x9c\x85") + " /scrsites       - Download pool\n" +
-				"-> " + em("5298970748172385213", "\xe2\x9c\x85") + " /site &lt;keyword&gt; - Search sites\n" +
-				"-> " + em("5042290883949495533", "\xe2\x9c\x85") + " /resetbl        - Reset blacklist\n\n" +
+				"-> " + em("5298970748172385213", "\xe2\x9c\x85") + " /site &lt;keyword&gt; - Search sites\n\n" +
 				em("5039623284056917259", "\xe2\x9c\x85") + " <b>Info</b>\n" +
 				"-> " + em("4936468614967460670", "\xe2\x9c\x85") + " /stats  - Global stats\n" +
 				"-> " + em("4936468614967460670", "\xe2\x9c\x85") + " /active - Live sessions\n\n" +
@@ -3617,33 +3553,6 @@ bot.Handle("/admin", func(c tele.Context) error {
 		return c.Send(fmt.Sprintf(" Daily free limit set to %d.", limit))
 	})
 
-	bot.Handle("/blacklistsite", func(c tele.Context) error {
-		if !isAdmin(c.Sender().ID) {
-			return c.Send(" Admin only.")
-		}
-		site := strings.TrimSpace(c.Message().Payload)
-		if site == "" {
-			return c.Send("Usage: /blacklistsite &lt;url&gt;")
-		}
-		site = strings.TrimRight(site, "/")
-		if !strings.HasPrefix(site, "http") {
-			site = "https://" + site
-		}
-		blacklistSite(site)
-		return c.Send(" Site blacklisted: " + site)
-	})
-
-	bot.Handle("/resetbl", func(c tele.Context) error {
-		if !isAdmin(c.Sender().ID) {
-			return c.Send(" Admin only.")
-		}
-		blacklistMu.Lock()
-		count := len(blacklisted)
-		blacklisted = make(map[string]bool)
-		blacklistMu.Unlock()
-		return c.Send(fmt.Sprintf(" Blacklist cleared (%d sites removed).", count))
-	})
-
 	bot.Handle("/scrsites", func(c tele.Context) error {
 		if !isAdmin(c.Sender().ID) {
 			return c.Send(" Admin only.")
@@ -3660,12 +3569,6 @@ bot.Handle("/admin", func(c tele.Context) error {
 		sitePoolMu.RLock()
 		poolCount := len(sitePool)
 		sitePoolMu.RUnlock()
-		blacklistMu.RLock()
-		blCount := len(blacklisted)
-		for s := range blacklisted {
-			allSites[s] = true
-		}
-		blacklistMu.RUnlock()
 		var list []string
 		for s := range allSites {
 			list = append(list, s)
@@ -3675,7 +3578,7 @@ bot.Handle("/admin", func(c tele.Context) error {
 		doc := &tele.Document{
 			File:     tele.FromReader(buf),
 			FileName: "sites_pool.txt",
-			Caption:  fmt.Sprintf(" Site Pool (%d sites)\nPool: %d | Blacklisted: %d", len(list), poolCount, blCount),
+			Caption:  fmt.Sprintf(" Site Pool (%d sites)\nPool: %d", len(list), poolCount),
 		}
 		return c.Send(doc)
 	})

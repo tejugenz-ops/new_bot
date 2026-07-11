@@ -77,29 +77,29 @@ func chooseAffordableSite(apiURL string, maxAmount float64) (WorkingSite, error)
 }
 
 func fetchAffordableSites(apiURL string, maxAmount float64) ([]WorkingSite, error) {
-	const pageSize = 100
-	const maxPages = 30
+	const pageSize = 500
+	const maxPages = 4000
+	const fetchConcurrency = 40
 
 	type pageResult struct {
 		offset  int
 		objects []map[string]any
+		total   int64
 		html    string
 		err     error
 	}
 
-	resultsCh := make(chan pageResult, maxPages)
+	httpClient := &http.Client{Timeout: 15 * time.Second}
 
-	fetchPage := func(offset int) {
+	fetchPage := func(offset int) pageResult {
 		pageURL := fmt.Sprintf("%s?limit=%d&offset=%d", apiURL, pageSize, offset)
-		httpClient := &http.Client{Timeout: 10 * time.Second}
 
 		var body []byte
 		maxRetries := 3
 		for attempt := 0; attempt < maxRetries; attempt++ {
 			req, reqErr := http.NewRequest("GET", pageURL, nil)
 			if reqErr != nil {
-				resultsCh <- pageResult{offset: offset, err: reqErr}
-				return
+				return pageResult{offset: offset, err: reqErr}
 			}
 			req.Header.Set("accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
 			req.Header.Set("accept-language", "en-US,en;q=0.9")
@@ -111,8 +111,7 @@ func fetchAffordableSites(apiURL string, maxAmount float64) ([]WorkingSite, erro
 					time.Sleep(time.Duration(500*(attempt+1)) * time.Millisecond)
 					continue
 				}
-				resultsCh <- pageResult{offset: offset, err: err}
-				return
+				return pageResult{offset: offset, err: err}
 			}
 			body, _ = io.ReadAll(resp.Body)
 			resp.Body.Close()
@@ -121,47 +120,68 @@ func fetchAffordableSites(apiURL string, maxAmount float64) ([]WorkingSite, erro
 
 		bodyStr := string(body)
 		if strings.HasPrefix(strings.TrimSpace(bodyStr), "<!DOCTYPE html") || strings.Contains(bodyStr, "<tbody>") {
-			resultsCh <- pageResult{offset: offset, html: bodyStr}
-			return
+			return pageResult{offset: offset, html: bodyStr}
 		}
 
-		var payload any
+		var payload map[string]any
 		if err := json.Unmarshal(body, &payload); err != nil {
-			resultsCh <- pageResult{offset: offset, err: err}
-			return
+			return pageResult{offset: offset, err: err}
 		}
-		resultsCh <- pageResult{offset: offset, objects: collectObjects(payload)}
+		var total int64
+		if raw, ok := payload["total"]; ok {
+			if n, ok := toFloat(raw); ok {
+				total = int64(n)
+			}
+		}
+		return pageResult{offset: offset, objects: collectObjects(payload), total: total}
 	}
 
-	var wg sync.WaitGroup
-	for i := 0; i < maxPages; i++ {
-		wg.Add(1)
-		go func(offset int) {
-			defer wg.Done()
-			fetchPage(offset)
-		}(i * pageSize)
+	first := fetchPage(0)
+	if first.err != nil {
+		return nil, first.err
 	}
-	go func() {
-		wg.Wait()
-		close(resultsCh)
-	}()
-
-	pages := make(map[int]pageResult)
-	var htmlBody string
-	for pr := range resultsCh {
-		if pr.err != nil {
-			continue
-		}
-		if pr.html != "" && htmlBody == "" {
-			htmlBody = pr.html
-		}
-		pages[pr.offset] = pr
-	}
-
-	if htmlBody != "" {
-		sites := parseDashboardHTMLSites(htmlBody, maxAmount)
+	if first.html != "" {
+		sites := parseDashboardHTMLSites(first.html, maxAmount)
 		fmt.Printf("[SITES] fetched %d affordable sites (under $%.0f) [HTML]\n", len(sites), maxAmount)
 		return sites, nil
+	}
+
+	total := first.total
+	pagesNeeded := 1
+	if total > 0 {
+		pagesNeeded = int((total + pageSize - 1) / pageSize)
+	}
+	if pagesNeeded > maxPages {
+		pagesNeeded = maxPages
+	}
+	fmt.Printf("[SITES] API total=%d, fetching %d pages (%d/page)\n", total, pagesNeeded, pageSize)
+
+	pages := make(map[int]pageResult, pagesNeeded)
+	pages[0] = first
+
+	if pagesNeeded > 1 {
+		resultsCh := make(chan pageResult, pagesNeeded-1)
+		sem := make(chan struct{}, fetchConcurrency)
+		var wg sync.WaitGroup
+		for i := 1; i < pagesNeeded; i++ {
+			wg.Add(1)
+			go func(offset int) {
+				defer wg.Done()
+				sem <- struct{}{}
+				defer func() { <-sem }()
+				resultsCh <- fetchPage(offset)
+			}(i * pageSize)
+		}
+		go func() {
+			wg.Wait()
+			close(resultsCh)
+		}()
+		for pr := range resultsCh {
+			if pr.err != nil {
+				continue
+			}
+			pages[pr.offset] = pr
+		}
 	}
 
 	var offsets []int
@@ -193,7 +213,7 @@ func fetchAffordableSites(apiURL string, maxAmount float64) ([]WorkingSite, erro
 	if len(out) == 0 {
 		return nil, fmt.Errorf("no affordable sites found in API payload")
 	}
-	fmt.Printf("[SITES] fetched %d affordable sites (under $%.0f)\n", len(out), maxAmount)
+	fmt.Printf("[SITES] fetched %d affordable sites (under $%.0f) out of %d total\n", len(out), maxAmount, total)
 	return out, nil
 }
 

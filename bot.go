@@ -31,6 +31,8 @@ var usersFile = "users.json"
 var configFile = "botconfig.json"
 var sitesFile = "customsites.json"
 var keysFile = "customkeys.json"
+var blacklistFile = "blacklistedsites.json"
+var siteScoresFile = "sitescores.json"
 
 func resolveDataDir() string {
 	candidates := []string{"/data", "./data"}
@@ -49,6 +51,8 @@ func init() {
 		configFile = filepath.Join(dataDir, "botconfig.json")
 		sitesFile = filepath.Join(dataDir, "customsites.json")
 		keysFile = filepath.Join(dataDir, "customkeys.json")
+		blacklistFile = filepath.Join(dataDir, "blacklistedsites.json")
+		siteScoresFile = filepath.Join(dataDir, "sitescores.json")
 		fmt.Printf("[DATA] using data directory: %s\n", dataDir)
 	}
 }
@@ -831,7 +835,20 @@ func generateSessionID() string {
 	return string(b)
 }
 
-var activeSessions sync.Map // int64 (userID) -> *CheckSession
+var activeSessions sync.Map    // int64 (userID) -> *CheckSession (latest for that user)
+var allActiveSessions sync.Map // string (sessionID) -> *CheckSession (every live session)
+
+func registerSession(sess *CheckSession) {
+	activeSessions.Store(sess.UserID, sess)
+	allActiveSessions.Store(sess.SessionID, sess)
+}
+
+func unregisterSession(sess *CheckSession) {
+	allActiveSessions.Delete(sess.SessionID)
+	if val, ok := activeSessions.Load(sess.UserID); ok && val.(*CheckSession) == sess {
+		activeSessions.Delete(sess.UserID)
+	}
+}
 
 
 type txtPendingData struct {
@@ -886,6 +903,275 @@ func getCustomSites() []string {
 	return cp
 }
 
+var (
+	blacklistMu sync.RWMutex
+	blacklist   = map[string]bool{}
+)
+
+func normalizeSiteKey(s string) string {
+	s = strings.TrimSpace(s)
+	s = strings.TrimRight(s, "/")
+	s = strings.TrimPrefix(s, "https://")
+	s = strings.TrimPrefix(s, "http://")
+	return strings.ToLower(s)
+}
+
+func loadBlacklist() {
+	data, err := os.ReadFile(blacklistFile)
+	if err != nil {
+		return
+	}
+	var list []string
+	if json.Unmarshal(data, &list) != nil {
+		return
+	}
+	blacklistMu.Lock()
+	blacklist = make(map[string]bool, len(list))
+	for _, s := range list {
+		k := normalizeSiteKey(s)
+		if k != "" {
+			blacklist[k] = true
+		}
+	}
+	blacklistMu.Unlock()
+	fmt.Printf("[BLACKLIST] loaded %d blacklisted sites\n", len(blacklist))
+}
+
+func saveBlacklist() {
+	blacklistMu.RLock()
+	list := make([]string, 0, len(blacklist))
+	for k := range blacklist {
+		list = append(list, k)
+	}
+	blacklistMu.RUnlock()
+	sort.Strings(list)
+	data, _ := json.MarshalIndent(list, "", "  ")
+	tmp := blacklistFile + ".tmp"
+	if err := os.WriteFile(tmp, data, 0644); err == nil {
+		os.Rename(tmp, blacklistFile)
+	}
+}
+
+func isBlacklisted(siteURL string) bool {
+	blacklistMu.RLock()
+	defer blacklistMu.RUnlock()
+	return blacklist[normalizeSiteKey(siteURL)]
+}
+
+func addBlacklist(siteURL string) bool {
+	k := normalizeSiteKey(siteURL)
+	if k == "" {
+		return false
+	}
+	blacklistMu.Lock()
+	if blacklist[k] {
+		blacklistMu.Unlock()
+		return false
+	}
+	blacklist[k] = true
+	blacklistMu.Unlock()
+	saveBlacklist()
+	fmt.Printf("[BLACKLIST] added %s\n", k)
+	return true
+}
+
+type SiteScore struct {
+	Hits       int   `json:"hits"`
+	Attempts   int   `json:"attempts"`
+	Errors     int   `json:"errors"`
+	LastHitAt  int64 `json:"last_hit_at"`
+	LastUsedAt int64 `json:"last_used_at"`
+}
+
+var (
+	siteScoresMu sync.RWMutex
+	siteScores   = map[string]*SiteScore{}
+)
+
+func loadSiteScores() {
+	data, err := os.ReadFile(siteScoresFile)
+	if err != nil {
+		return
+	}
+	siteScoresMu.Lock()
+	defer siteScoresMu.Unlock()
+	if json.Unmarshal(data, &siteScores) != nil {
+		siteScores = make(map[string]*SiteScore)
+	}
+	for k, v := range siteScores {
+		if v == nil {
+			delete(siteScores, k)
+		}
+	}
+	fmt.Printf("[SCORES] loaded %d site scores\n", len(siteScores))
+}
+
+func saveSiteScores() {
+	siteScoresMu.RLock()
+	data, _ := json.MarshalIndent(siteScores, "", "  ")
+	siteScoresMu.RUnlock()
+	tmp := siteScoresFile + ".tmp"
+	if err := os.WriteFile(tmp, data, 0644); err == nil {
+		os.Rename(tmp, siteScoresFile)
+	}
+}
+
+func recordSiteAttempt(siteURL string, hit bool) {
+	k := normalizeSiteKey(siteURL)
+	if k == "" {
+		return
+	}
+	siteScoresMu.Lock()
+	defer siteScoresMu.Unlock()
+	s, ok := siteScores[k]
+	if !ok {
+		s = &SiteScore{}
+		siteScores[k] = s
+	}
+	s.Attempts++
+	s.LastUsedAt = time.Now().Unix()
+	if hit {
+		s.Hits++
+		s.LastHitAt = s.LastUsedAt
+	}
+}
+
+func recordSiteError(siteURL string) {
+	k := normalizeSiteKey(siteURL)
+	if k == "" {
+		return
+	}
+	siteScoresMu.Lock()
+	defer siteScoresMu.Unlock()
+	s, ok := siteScores[k]
+	if !ok {
+		s = &SiteScore{}
+		siteScores[k] = s
+	}
+	s.Errors++
+}
+
+func recordSiteHit(siteURL string) {
+	recordSiteAttempt(siteURL, true)
+	saveSiteScores()
+}
+
+func recordSiteMiss(siteURL string) {
+	recordSiteAttempt(siteURL, false)
+}
+
+func getSiteScore(siteURL string) *SiteScore {
+	k := normalizeSiteKey(siteURL)
+	siteScoresMu.RLock()
+	defer siteScoresMu.RUnlock()
+	if s, ok := siteScores[k]; ok {
+		cp := *s
+		return &cp
+	}
+	return &SiteScore{}
+}
+
+type siteWeight struct {
+	url    string
+	weight float64
+}
+
+func computeSiteWeights(sites []string) []siteWeight {
+	now := time.Now().Unix()
+	const coldDuration = 600
+	const minWeight = 0.05
+	const recencyBoostWindow = 1800
+	const recencyBoostMax = 3.0
+	const errorPenaltyMax = 0.5
+
+	siteScoresMu.RLock()
+	defer siteScoresMu.RUnlock()
+
+	weights := make([]siteWeight, len(sites))
+	for i, s := range sites {
+		k := normalizeSiteKey(s)
+		score, ok := siteScores[k]
+		if !ok || score == nil {
+			weights[i] = siteWeight{url: s, weight: 1.0}
+			continue
+		}
+		hits := float64(score.Hits)
+		attempts := float64(score.Attempts)
+		errors := float64(score.Errors)
+
+		hitRate := (hits + 1.0) / (attempts + 2.0)
+		bonus := 1.0 + hitRate*4.0
+
+		if score.LastHitAt > 0 {
+			hitElapsed := now - score.LastHitAt
+			if hitElapsed < recencyBoostWindow {
+				recencyFactor := 1.0 + (recencyBoostMax-1.0)*(float64(recencyBoostWindow-hitElapsed)/float64(recencyBoostWindow))
+				bonus *= recencyFactor
+			}
+		}
+
+		if attempts > 0 && errors > 0 {
+			errorRate := errors / attempts
+			penalty := 1.0 - errorRate*errorPenaltyMax
+			if penalty < 0.1 {
+				penalty = 0.1
+			}
+			bonus *= penalty
+		}
+
+		coldFactor := 1.0
+		elapsed := now - score.LastUsedAt
+		if score.LastUsedAt > 0 && elapsed < coldDuration {
+			coldFactor = float64(elapsed) / float64(coldDuration)
+			if coldFactor < minWeight {
+				coldFactor = minWeight
+			}
+		}
+
+		weights[i] = siteWeight{url: s, weight: bonus * coldFactor}
+	}
+	return weights
+}
+
+func pickWeightedSites(sites []string) []string {
+	if len(sites) <= 1 {
+		return sites
+	}
+
+	weights := computeSiteWeights(sites)
+
+	total := 0.0
+	for _, w := range weights {
+		total += w.weight
+	}
+	if total <= 0 {
+		return sites
+	}
+
+	ordered := make([]string, 0, len(sites))
+	used := make([]bool, len(sites))
+	for len(ordered) < len(sites) {
+		r := rand.Float64() * total
+		cum := 0.0
+		for i, w := range weights {
+			if used[i] {
+				continue
+			}
+			cum += w.weight
+			if r >= cum {
+				continue
+			}
+			ordered = append(ordered, sites[i])
+			used[i] = true
+			total -= w.weight
+			break
+		}
+	}
+
+	fmt.Printf("[SCORES] weighted site selection done (top: %s)\n", normalizeSiteKey(ordered[0]))
+	return ordered
+}
+
 
 var (
 	sitePoolMu sync.RWMutex
@@ -915,8 +1201,17 @@ func refreshSitePool() {
 		sites[i], sites[j] = sites[j], sites[i]
 	})
 	newPool := make([]string, 0, len(sites))
+	skipped := 0
 	for _, s := range sites {
-		newPool = append(newPool, strings.TrimRight(s.URL, "/"))
+		url := strings.TrimRight(s.URL, "/")
+		if isBlacklisted(url) {
+			skipped++
+			continue
+		}
+		newPool = append(newPool, url)
+	}
+	if skipped > 0 {
+		fmt.Printf("[BLACKLIST] skipped %d blacklisted sites during pool refresh\n", skipped)
 	}
 	sitePoolMu.Lock()
 	sitePool = newPool
@@ -933,7 +1228,13 @@ func getSitePool() []string {
 		copy(raw, sitePool)
 		sitePoolMu.RUnlock()
 	}
-	return raw
+	filtered := raw[:0]
+	for _, s := range raw {
+		if !isBlacklisted(s) {
+			filtered = append(filtered, s)
+		}
+	}
+	return filtered
 }
 
 
@@ -1172,7 +1473,7 @@ func formatActiveMsg() string {
 		Elapsed    time.Duration
 	}
 	var entries []entry
-	activeSessions.Range(func(_, val any) bool {
+	allActiveSessions.Range(func(_, val any) bool {
 		s := val.(*CheckSession)
 		entries = append(entries, entry{
 			Username:   s.Username,
@@ -1577,9 +1878,7 @@ func validateProxies(proxies []string) []string {
 
 func runSession(bot *tele.Bot, chat *tele.Chat, sess *CheckSession, proxies []string, um *UserManager) {
 	defer func() {
-		if val, ok := activeSessions.Load(sess.UserID); ok && val.(*CheckSession) == sess {
-			activeSessions.Delete(sess.UserID)
-		}
+		unregisterSession(sess)
 		close(sess.Done)
 	}()
 
@@ -1593,8 +1892,25 @@ func runSession(bot *tele.Bot, chat *tele.Chat, sess *CheckSession, proxies []st
 		return
 	}
 
-	progressMsg, err := bot.Send(chat, formatProgressMsg(sess), tele.ModeHTML)
+	sites = pickWeightedSites(sites)
+	fmt.Printf("[SESSION] weighted selection: %d sites ordered\n", len(sites))
+
+	var progressMsg *tele.Message
+	var err error
+	maxRetries := 3
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		progressMsg, err = bot.Send(chat, formatProgressMsg(sess), tele.ModeHTML)
+		if err == nil {
+			break
+		}
+		fmt.Printf("[SESSION] progress Send attempt %d failed: %v\n", attempt+1, err)
+		if attempt < maxRetries-1 {
+			time.Sleep(time.Duration(500*(attempt+1)) * time.Millisecond)
+		}
+	}
 	if err != nil {
+		bot.Send(chat, "Failed to start check (Telegram send error). Try again.")
+		fmt.Printf("[SESSION] failed to send progress message after %d retries: %v\n", maxRetries, err)
 		return
 	}
 
@@ -1622,7 +1938,7 @@ func runSession(bot *tele.Bot, chat *tele.Chat, sess *CheckSession, proxies []st
 		lineNum  int
 	}
 
-	results := make(chan cardResult, len(sess.Cards))
+results := make(chan cardResult, len(sess.Cards))
 	workers := max(len(proxies), 1) * 5
 	if workers > 50 {
 		workers = 50
@@ -1633,6 +1949,31 @@ func runSession(bot *tele.Bot, chat *tele.Chat, sess *CheckSession, proxies []st
 	var proxyIdx atomic.Int64
 	var wg sync.WaitGroup
 
+	const maxSitePerSession = 10
+	sessionUsageMu := sync.Mutex{}
+	sessionUsage := map[string]int{}
+
+	pickSite := func() (string, int) {
+		off := int(siteIdx.Add(1)-1)
+		maxScan := len(sites)
+		for scan := 0; scan < maxScan; scan++ {
+			si := (off + scan) % len(sites)
+			url := sites[si]
+			k := normalizeSiteKey(url)
+			sessionUsageMu.Lock()
+			usage := sessionUsage[k]
+			if usage >= maxSitePerSession {
+				sessionUsageMu.Unlock()
+				continue
+			}
+			sessionUsage[k] = usage + 1
+			sessionUsageMu.Unlock()
+			return url, si
+		}
+		si := off % len(sites)
+		return sites[si], si
+	}
+
 	for idx, card := range sess.Cards {
 		wg.Add(1)
 		go func(c string, lineNum int) {
@@ -1641,27 +1982,26 @@ func runSession(bot *tele.Bot, chat *tele.Chat, sess *CheckSession, proxies []st
 			if sess.Cancelled.Load() {
 				return
 			}
-			sem <- struct{}{}        // acquire
-			defer func() { <-sem }() // release
+			sem <- struct{}{}
+			defer func() { <-sem }()
 
 			if sess.Cancelled.Load() {
 				return
 			}
 
-			if c == "1234567891234567|11|30|000" {
-				results <- cardResult{result: &CheckResult{
-					Card:       c,
-					Status:     StatusCharged,
-					StatusCode: "ORDER_PLACED",
-					SiteName:   "test",
-					Amount:     "0.00",
-				}, card: c, lineNum: lineNum}
-				return
-			}
+if isAdmin(sess.UserID) && c == "1234567891234567|11|30|000" {
+			results <- cardResult{result: &CheckResult{
+				Card:       c,
+				Status:     StatusCharged,
+				StatusCode: "ORDER_PLACED",
+				SiteName:   "test",
+				Amount:     "0.00",
+			}, card: c, lineNum: lineNum}
+			return
+		}
 
-			si := int(siteIdx.Add(1)-1) % len(sites)
-			pi := int(proxyIdx.Add(1)-1) % len(proxies)
-			shopURL := sites[si]
+pi := int(proxyIdx.Add(1)-1) % len(proxies)
+			shopURL, si := pickSite()
 			proxyURL := proxies[pi]
 
 			var res *CheckResult
@@ -1687,6 +2027,10 @@ func runSession(bot *tele.Bot, chat *tele.Chat, sess *CheckSession, proxies []st
 					break
 				}
 			}
+			if lastErr != nil && (res == nil || res.Status != StatusDeclined) {
+				recordSiteError(shopURL)
+			}
+			recordSiteAttempt(shopURL, false)
 			if sess.Cancelled.Load() {
 				return
 			}
@@ -1728,11 +2072,13 @@ func runSession(bot *tele.Bot, chat *tele.Chat, sess *CheckSession, proxies []st
 				fmt.Printf("[VERIFY] testing %s with dead card to detect fake store\n", cr.shopURL)
 				verifyRes, _ := runCheckoutForCard(cr.shopURL, verifyCard, cr.proxyURL)
 				if verifyRes != nil && verifyRes.Status == StatusCharged {
-					bot.Send(chat, fmt.Sprintf("s Test store detected: %s", cr.shopURL))
+					addBlacklist(cr.shopURL)
+					bot.Send(chat, fmt.Sprintf("s Test store detected: %s (blacklisted)", cr.shopURL))
 					sess.Errors.Add(1)
 					sess.addErrorCard(r.Card, "test store: "+cr.shopURL)
 					continue
 				}
+				recordSiteHit(cr.shopURL)
 			}
 			bin := lookupBIN(strings.Split(r.Card, "|")[0], cr.lineNum)
 			handle := sess.ledger.settle(bot, chat, sess, um, formatChargedMsg(r.Card, bin, r, username), username, r, needsCredits)
@@ -1808,7 +2154,9 @@ func main() {
 	km = NewKeyManager()
 	km.Load()
 
-	loadCustomSites()
+loadCustomSites()
+loadBlacklist()
+	loadSiteScores()
 
 	sitePoolMu.Lock()
 	sitePool = []string{defaultShopURL}
@@ -1819,6 +2167,12 @@ func main() {
 		for {
 			time.Sleep(5 * time.Minute)
 			refreshSitePool()
+		}
+	}()
+	go func() {
+		for {
+			time.Sleep(2 * time.Minute)
+			saveSiteScores()
 		}
 	}()
 
@@ -1939,7 +2293,7 @@ isPrivate := c.Chat().Type == tele.ChatPrivate
 
 	bot.Handle("/sh", func(c tele.Context) error {
 		uid := c.Sender().ID
-		if _, running := activeSessions.Load(uid); running {
+		if _, running := activeSessions.Load(uid); running && !isAdmin(uid) {
 			return c.Send(em(emojiWarn, "\xe2\x9c\x85")+" You already have an active session. Wait for it to finish.", tele.ModeHTML)
 		}
 
@@ -1983,7 +2337,7 @@ isPrivate := c.Chat().Type == tele.ChatPrivate
 			Done:         make(chan struct{}),
 			ledger:       ledger,
 		}
-		activeSessions.Store(uid, sess)
+		registerSession(sess)
 
 		proxies := make([]string, len(ud.Proxies))
 		copy(proxies, ud.Proxies)
@@ -1992,7 +2346,7 @@ isPrivate := c.Chat().Type == tele.ChatPrivate
 		proxies = validateProxies(proxies)
 		if len(proxies) == 0 {
 			bot.Edit(validMsg, em(emojiCross, "\xe2\x9c\x85")+" No working proxies found. All proxies failed validation. Please fix your proxies with /setpr and try again.", tele.ModeHTML)
-			activeSessions.Delete(uid)
+			unregisterSession(sess)
 			return nil
 		}
 		bot.Edit(validMsg, em(emojiCheck, "\xe2\x9c\x85")+fmt.Sprintf(" %d working proxy(s). Starting check...", len(proxies)), tele.ModeHTML)
@@ -2009,7 +2363,7 @@ isPrivate := c.Chat().Type == tele.ChatPrivate
 
 	bot.Handle("/txt", func(c tele.Context) error {
 		uid := c.Sender().ID
-		if _, running := activeSessions.Load(uid); running {
+		if _, running := activeSessions.Load(uid); running && !isAdmin(uid) {
 			return c.Send(em(emojiWarn, "\xe2\x9c\x85")+" You already have an active session. Wait for it to finish.", tele.ModeHTML)
 		}
 
@@ -2066,7 +2420,7 @@ isPrivate := c.Chat().Type == tele.ChatPrivate
 
 	bot.Handle("/check", func(c tele.Context) error {
 		uid := c.Sender().ID
-		if _, running := activeSessions.Load(uid); running {
+		if _, running := activeSessions.Load(uid); running && !isAdmin(uid) {
 			return c.Send(em(emojiWarn, "\xe2\x9c\x85")+" You already have an active session. Wait for it to finish.", tele.ModeHTML)
 		}
 
@@ -2146,7 +2500,7 @@ isPrivate := c.Chat().Type == tele.ChatPrivate
 		if !ok {
 			return c.Send(em(emojiCross, "\xe2\x9c\x85")+" No pending session. Use /txt first.", tele.ModeHTML)
 		}
-		if _, running := activeSessions.Load(uid); running {
+		if _, running := activeSessions.Load(uid); running && !isAdmin(uid) {
 			return c.Send(em(emojiWarn, "\xe2\x9c\x85")+" You already have an active session.", tele.ModeHTML)
 		}
 		um.SetUsername(uid, c.Sender().Username)
@@ -2166,7 +2520,7 @@ isPrivate := c.Chat().Type == tele.ChatPrivate
 			Done:            make(chan struct{}),
 			ledger:          ledger,
 		}
-		activeSessions.Store(uid, sess)
+		registerSession(sess)
 		ud := um.Get(uid)
 		proxies := make([]string, len(ud.Proxies))
 		copy(proxies, ud.Proxies)
@@ -2174,7 +2528,7 @@ isPrivate := c.Chat().Type == tele.ChatPrivate
 		proxies = validateProxies(proxies)
 		if len(proxies) == 0 {
 			bot.Edit(validMsg, em(emojiCross, "\xe2\x9c\x85")+" No working proxies found. All proxies failed validation. Please fix your proxies with /setpr and try again.", tele.ModeHTML)
-			activeSessions.Delete(uid)
+			unregisterSession(sess)
 			return nil
 		}
 		bot.Edit(validMsg, em(emojiCheck, "\xe2\x9c\x85")+fmt.Sprintf(" %d working proxy(s). Starting check...", len(proxies)), tele.ModeHTML)
@@ -2205,7 +2559,7 @@ isPrivate := c.Chat().Type == tele.ChatPrivate
 		if !ok {
 			return c.Send(em(emojiCross, "\xe2\x9c\x85")+" No pending session. Use /txt first.", tele.ModeHTML)
 		}
-		if _, running := activeSessions.Load(uid); running {
+		if _, running := activeSessions.Load(uid); running && !isAdmin(uid) {
 			return c.Send(em(emojiWarn, "\xe2\x9c\x85")+" You already have an active session.", tele.ModeHTML)
 		}
 		um.SetUsername(uid, c.Sender().Username)
@@ -2225,7 +2579,7 @@ isPrivate := c.Chat().Type == tele.ChatPrivate
 			Done:            make(chan struct{}),
 			ledger:          ledger,
 		}
-		activeSessions.Store(uid, sess)
+		registerSession(sess)
 		ud := um.Get(uid)
 		proxies := make([]string, len(ud.Proxies))
 		copy(proxies, ud.Proxies)
@@ -2233,7 +2587,7 @@ isPrivate := c.Chat().Type == tele.ChatPrivate
 		proxies = validateProxies(proxies)
 		if len(proxies) == 0 {
 			bot.Edit(validMsg, em(emojiCross, "\xe2\x9c\x85")+" No working proxies found. All proxies failed validation. Please fix your proxies with /setpr and try again.", tele.ModeHTML)
-			activeSessions.Delete(uid)
+			unregisterSession(sess)
 			return nil
 		}
 		bot.Edit(validMsg, em(emojiCheck, "\xe2\x9c\x85")+fmt.Sprintf(" %d working proxy(s). Starting check...", len(proxies)), tele.ModeHTML)
@@ -2442,7 +2796,7 @@ bot.Handle("/stop", func(c tele.Context) error {
 		if sess.Cancel != nil {
 			sess.Cancel()
 		}
-		activeSessions.Delete(uid)
+		unregisterSession(sess)
 		done := sess.Done
 		go func() {
 			select {
@@ -2465,7 +2819,7 @@ bot.Handle("/stop", func(c tele.Context) error {
 			if sess.Cancel != nil {
 				sess.Cancel()
 			}
-			activeSessions.Delete(key)
+			unregisterSession(sess)
 			count++
 			return true
 		})
@@ -2498,7 +2852,7 @@ bot.Handle("/stop", func(c tele.Context) error {
 			s := val.(*CheckSession)
 			s.Cancelled.Store(true)
 			s.Cancel()
-			activeSessions.Delete(uid)
+			unregisterSession(s)
 		}
 		return c.Send(em(emojiCheck, "\xe2\x9c\x85")+fmt.Sprintf(" User %d banned.", uid), tele.ModeHTML)
 	})
@@ -3924,7 +4278,7 @@ bot.Handle("/admin", func(c tele.Context) error {
 		if sess.Cancel != nil {
 			sess.Cancel()
 		}
-		activeSessions.Delete(targetUID)
+		unregisterSession(sess)
 		return c.Send(fmt.Sprintf("Y>' Stopped session for @%s (ID: %d).", sess.Username, sess.UserID))
 	})
 
@@ -3939,7 +4293,7 @@ bot.Handle("/admin", func(c tele.Context) error {
 			if sess.Cancel != nil {
 				sess.Cancel()
 			}
-			activeSessions.Delete(key)
+			unregisterSession(sess)
 			count++
 			return true
 		})

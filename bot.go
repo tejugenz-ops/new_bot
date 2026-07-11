@@ -1936,6 +1936,7 @@ func runSession(bot *tele.Bot, chat *tele.Chat, sess *CheckSession, proxies []st
 		proxyURL string
 		card     string
 		lineNum  int
+		hadError bool
 	}
 
 results := make(chan cardResult, len(sess.Cards))
@@ -1948,31 +1949,6 @@ results := make(chan cardResult, len(sess.Cards))
 	var siteIdx atomic.Int64
 	var proxyIdx atomic.Int64
 	var wg sync.WaitGroup
-
-	const maxSitePerSession = 10
-	sessionUsageMu := sync.Mutex{}
-	sessionUsage := map[string]int{}
-
-	pickSite := func() (string, int) {
-		off := int(siteIdx.Add(1)-1)
-		maxScan := len(sites)
-		for scan := 0; scan < maxScan; scan++ {
-			si := (off + scan) % len(sites)
-			url := sites[si]
-			k := normalizeSiteKey(url)
-			sessionUsageMu.Lock()
-			usage := sessionUsage[k]
-			if usage >= maxSitePerSession {
-				sessionUsageMu.Unlock()
-				continue
-			}
-			sessionUsage[k] = usage + 1
-			sessionUsageMu.Unlock()
-			return url, si
-		}
-		si := off % len(sites)
-		return sites[si], si
-	}
 
 	for idx, card := range sess.Cards {
 		wg.Add(1)
@@ -2000,8 +1976,9 @@ if isAdmin(sess.UserID) && c == "1234567891234567|11|30|000" {
 			return
 		}
 
-pi := int(proxyIdx.Add(1)-1) % len(proxies)
-			shopURL, si := pickSite()
+			si := int(siteIdx.Add(1)-1) % len(sites)
+			pi := int(proxyIdx.Add(1)-1) % len(proxies)
+			shopURL := sites[si]
 			proxyURL := proxies[pi]
 
 			var res *CheckResult
@@ -2027,14 +2004,10 @@ pi := int(proxyIdx.Add(1)-1) % len(proxies)
 					break
 				}
 			}
-			if lastErr != nil && (res == nil || res.Status != StatusDeclined) {
-				recordSiteError(shopURL)
-			}
-			recordSiteAttempt(shopURL, false)
 			if sess.Cancelled.Load() {
 				return
 			}
-			results <- cardResult{result: res, err: lastErr, shopURL: shopURL, proxyURL: proxyURL, card: c, lineNum: lineNum}
+			results <- cardResult{result: res, err: lastErr, shopURL: shopURL, proxyURL: proxyURL, card: c, lineNum: lineNum, hadError: lastErr != nil && (res == nil || res.Status != StatusDeclined)}
 		}(card, sess.OriginalIndices[idx]+1)
 	}
 
@@ -2062,7 +2035,18 @@ pi := int(proxyIdx.Add(1)-1) % len(proxies)
 			sess.Errors.Add(1)
 			sess.addErrorCard(cr.card, fmt.Sprintf("nil result: %v", cr.err))
 			fmt.Printf("[ERROR] card returned nil result, err: %v\n", cr.err)
+			if cr.shopURL != "" {
+				recordSiteError(cr.shopURL)
+				recordSiteAttempt(cr.shopURL, false)
+			}
 			continue
+		}
+
+		if cr.shopURL != "" {
+			if cr.hadError {
+				recordSiteError(cr.shopURL)
+			}
+			recordSiteAttempt(cr.shopURL, false)
 		}
 
 		switch r.Status {

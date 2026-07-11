@@ -28,7 +28,7 @@ const path = "test.txt"
 const proxyPath = "px.txt"
 
 const workingSitesAPI = "https://adventurous-renewal-production-cc37.up.railway.app/api/sites"
-const maxSiteAmount = 10.0
+const maxSiteAmount = 5.0
 
 
 type ProductsResponse struct {

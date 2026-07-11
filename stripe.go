@@ -1118,14 +1118,26 @@ func checkStripeDollarCard(cc, mm, yy, cvv, proxyURL string) *CheckResult {
 
 func runStripeGateSession(bot *tele.Bot, chat *tele.Chat, sess *CheckSession, proxies []string, um *UserManager, fn stripeCheckFn) {
 	defer func() {
-		if val, ok := activeSessions.Load(sess.UserID); ok && val.(*CheckSession) == sess {
-			activeSessions.Delete(sess.UserID)
-		}
+		unregisterSession(sess)
 		close(sess.Done)
 	}()
 
-	progressMsg, err := bot.Send(chat, formatProgressMsg(sess), tele.ModeHTML)
+	var progressMsg *tele.Message
+	var err error
+	maxRetries := 3
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		progressMsg, err = bot.Send(chat, formatProgressMsg(sess), tele.ModeHTML)
+		if err == nil {
+			break
+		}
+		fmt.Printf("[SESSION] progress Send attempt %d failed: %v\n", attempt+1, err)
+		if attempt < maxRetries-1 {
+			time.Sleep(time.Duration(500*(attempt+1)) * time.Millisecond)
+		}
+	}
 	if err != nil {
+		bot.Send(chat, "Failed to start check (Telegram send error). Try again.")
+		fmt.Printf("[SESSION] failed to send progress message after %d retries: %v\n", maxRetries, err)
 		return
 	}
 
@@ -1277,7 +1289,7 @@ func runStripeGateSession(bot *tele.Bot, chat *tele.Chat, sess *CheckSession, pr
 func registerStripeInline(bot *tele.Bot, cmd, gateName string, um *UserManager, fn stripeCheckFn) {
 	bot.Handle(cmd, func(c tele.Context) error {
 		uid := c.Sender().ID
-		if _, running := activeSessions.Load(uid); running {
+		if _, running := activeSessions.Load(uid); running && !isAdmin(uid) {
 			return c.Send(em(emojiWarn, "⚠️")+" You already have an active session. Wait for it to finish.", tele.ModeHTML)
 		}
 		um.SetUsername(uid, c.Sender().Username)
@@ -1317,7 +1329,7 @@ func registerStripeInline(bot *tele.Bot, cmd, gateName string, um *UserManager, 
 			Done:            make(chan struct{}),
 			ledger:          ledger,
 		}
-		activeSessions.Store(uid, sess)
+		registerSession(sess)
 		proxies := make([]string, len(ud.Proxies))
 		copy(proxies, ud.Proxies)
 		go runStripeGateSession(bot, c.Chat(), sess, proxies, um, fn)
@@ -1330,7 +1342,7 @@ func registerStripeInline(bot *tele.Bot, cmd, gateName string, um *UserManager, 
 func registerStripeFile(bot *tele.Bot, cmd, gateName string, um *UserManager, fn stripeCheckFn) {
 	bot.Handle(cmd, func(c tele.Context) error {
 		uid := c.Sender().ID
-		if _, running := activeSessions.Load(uid); running {
+		if _, running := activeSessions.Load(uid); running && !isAdmin(uid) {
 			return c.Send(em(emojiWarn, "⚠️")+" You already have an active session. Wait for it to finish.", tele.ModeHTML)
 		}
 		ud := um.Get(uid)

